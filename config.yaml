@@ -1,0 +1,7 @@
+droplet_name: example-droplet
+region: nyc3
+size: s-1vcpu-1gb
+image_slug: ubuntu-25-10-x64
+tags:
+  - web
+  - production
