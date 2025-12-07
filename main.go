@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -91,6 +92,10 @@ var (
 	bgColor        = lipgloss.Color("235") // dark gray
 	borderColor    = lipgloss.Color("39")  // cyan
 	highlightColor = lipgloss.Color("226") // yellow for highlights
+	
+	// SSH connection info (set when user wants to SSH)
+	sshIP   string
+	sshName string
 
 	// Panel styles
 	panelStyle = lipgloss.NewStyle().
@@ -389,6 +394,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		case "s", "S":
+			// SSH into selected droplet
+			if m.currentView == "droplets" {
+				if m.table.SelectedRow() != nil && len(m.table.SelectedRow()) > 0 {
+					selectedName := m.table.SelectedRow()[0]
+					for _, d := range m.droplets {
+						if d.Name == selectedName {
+							// Get IP address
+							var ip string
+							if len(d.Networks.V4) > 0 {
+								ip = d.Networks.V4[0].IPAddress
+							}
+							
+							if ip == "" {
+								m.err = fmt.Errorf("droplet %s has no IP address", d.Name)
+								return m, nil
+							}
+							
+							// Check if droplet is active
+							if d.Status != "active" {
+								m.err = fmt.Errorf("droplet %s is not active (status: %s)", d.Name, d.Status)
+								return m, nil
+							}
+							
+							// Store SSH info and exit program
+							sshIP = ip
+							sshName = d.Name
+							return m, tea.Sequence(
+								tea.ExitAltScreen,
+								tea.Quit,
+							)
+						}
+					}
+				}
+			}
+			return m, nil
 		case "enter":
 			if m.table.SelectedRow() != nil && len(m.table.SelectedRow()) > 0 {
 				selectedName := m.table.SelectedRow()[0]
@@ -540,9 +581,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.WindowSizeMsg:
-		// Store raw dimensions
+		// iTerm optimization: Store raw dimensions accurately
 		rawWidth := msg.Width
 		rawHeight := msg.Height
+
+		// iTerm: Ensure we use actual terminal dimensions
+		// Don't override if terminal reports valid size
+		if rawWidth <= 0 {
+			rawWidth = 120 // Fallback for iTerm if detection fails
+		}
+		if rawHeight <= 0 {
+			rawHeight = 40 // Fallback for iTerm if detection fails
+		}
 
 		// Ensure minimum dimensions but store actual values
 		if rawWidth < 40 {
@@ -552,7 +602,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			rawHeight = 10
 		}
 
-		// Update model dimensions
+		// Update model dimensions - iTerm will use actual reported size
 		m.width = rawWidth
 		m.height = rawHeight
 
@@ -1349,23 +1399,52 @@ func (m model) renderTopBarTwoPanel() string {
 	// Two panel layout for medium screens (95-145 chars)
 	panelPadding := 4
 	availableWidth := m.width - panelPadding
-	panelWidth := (availableWidth / 2) - 2
-
-	// Ensure minimum width - if too small, fall back to vertical
-	if panelWidth < 35 {
-		return m.renderTopBarVertical()
+	// Ensure left panel has minimum width for full visibility (minimum 45 chars)
+	leftPanelWidth := (availableWidth / 2) - 2
+	if leftPanelWidth < 45 {
+		leftPanelWidth = 45
 	}
+	rightPanelWidth := availableWidth - leftPanelWidth - 4
+	if rightPanelWidth < 35 {
+		rightPanelWidth = 35
+		leftPanelWidth = availableWidth - rightPanelWidth - 4
+		if leftPanelWidth < 40 {
+			return m.renderTopBarVertical()
+		}
+	}
+	panelWidth := leftPanelWidth
 
 	// Left panel - Account info (Summary)
 	var accountInfo strings.Builder
 	accountInfo.WriteString(headerStyle.Render("DigitalOcean"))
 	accountInfo.WriteString("\n")
 
-	// Always show essential summary info
-	accountInfo.WriteString(labelStyle.Render("Droplets: ") + valueStyle.Render(fmt.Sprintf("%d", m.dropletCount)))
-	accountInfo.WriteString("\n")
-	accountInfo.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(truncateString(m.selectedRegion, panelWidth-15)))
-	accountInfo.WriteString("\n")
+	// Always show essential summary info - prioritize visibility
+	if m.currentView == "cluster-resources" && m.selectedCluster != nil {
+		accountInfo.WriteString(labelStyle.Render("Cluster: ") + valueStyle.Render(m.selectedCluster.Name))
+		accountInfo.WriteString("\n")
+		accountInfo.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedCluster.RegionSlug))
+		accountInfo.WriteString("\n")
+		namespaceDisplay := "all"
+		if m.selectedNamespace != "" {
+			namespaceDisplay = m.selectedNamespace
+		}
+		accountInfo.WriteString(labelStyle.Render("Namespace: ") + valueStyle.Render(namespaceDisplay))
+		accountInfo.WriteString("\n")
+		accountInfo.WriteString(labelStyle.Render("Resource: ") + valueStyle.Render(strings.Title(m.clusterResourceType)))
+		accountInfo.WriteString("\n")
+		accountInfo.WriteString(labelStyle.Render("Count: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.clusterResources))))
+	} else if m.currentView == "clusters" {
+		accountInfo.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Kubernetes Clusters"))
+		accountInfo.WriteString("\n")
+		accountInfo.WriteString(labelStyle.Render("Clusters: ") + valueStyle.Render(fmt.Sprintf("%d", m.clusterCount)))
+	} else {
+		accountInfo.WriteString(labelStyle.Render("Droplets: ") + valueStyle.Render(fmt.Sprintf("%d", m.dropletCount)))
+		accountInfo.WriteString("\n")
+		// Don't truncate region - show full region name
+		accountInfo.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedRegion))
+		accountInfo.WriteString("\n")
+	}
 
 	refreshTime := "N/A"
 	if !m.lastRefresh.IsZero() {
@@ -1373,13 +1452,10 @@ func (m model) renderTopBarTwoPanel() string {
 	}
 	accountInfo.WriteString(labelStyle.Render("Refresh: ") + valueStyle.Render(refreshTime))
 
-	// Show account info if available and there's space
+	// Show account status if available
 	if m.account != nil && panelWidth > 40 {
 		accountInfo.WriteString("\n")
-		email := truncateString(m.account.Email, panelWidth-15)
-		if email != "" {
-			accountInfo.WriteString(labelStyle.Render("Account: ") + valueStyle.Render(email))
-		}
+		accountInfo.WriteString(labelStyle.Render("Status: ") + valueStyle.Render(m.account.Status))
 	}
 
 	// Ensure panel has minimum content even if narrow - make sure it's visible
@@ -1400,17 +1476,19 @@ func (m model) renderTopBarTwoPanel() string {
 	}
 
 	// Right panel - Keybindings and Regions
+	// CRITICAL: Always show 1, 2, n first - direct write to ensure visibility
 	var rightContent strings.Builder
 	rightContent.WriteString(headerStyle.Render("Keys"))
 	rightContent.WriteString("\n")
-	keybindings := []string{
-		keyStyle.Render("<n>") + " New",
-		keyStyle.Render("<r>") + " Refresh",
-		keyStyle.Render("<d>") + " Delete",
-		keyStyle.Render("<enter>") + " View",
-		keyStyle.Render("<q>") + " Quit",
-	}
-	rightContent.WriteString(strings.Join(keybindings, " | "))
+	// Direct write to ensure 1, 2, n are always visible
+	rightContent.WriteString(keyStyle.Render("1") + " Droplets | ")
+	rightContent.WriteString(keyStyle.Render("2") + " Clusters | ")
+	rightContent.WriteString(keyStyle.Render("n") + " New | ")
+	rightContent.WriteString(keyStyle.Render("r") + " Refresh | ")
+	rightContent.WriteString(keyStyle.Render("d") + " Delete | ")
+	rightContent.WriteString(keyStyle.Render("s") + " SSH | ")
+	rightContent.WriteString(keyStyle.Render("enter") + " View | ")
+	rightContent.WriteString(keyStyle.Render("q") + " Quit")
 	rightContent.WriteString("\n")
 	rightContent.WriteString(headerStyle.Render("Regions"))
 	rightContent.WriteString("\n")
@@ -1425,23 +1503,59 @@ func (m model) renderTopBarTwoPanel() string {
 	}
 	rightContent.WriteString(regionLine)
 
-	rightPanel := panelStyle.Width(panelWidth).Render(rightContent.String())
+	// Use rightPanelWidth if defined, otherwise panelWidth
+	rightWidth := rightPanelWidth
+	if rightWidth == 0 {
+		rightWidth = panelWidth
+	}
+	rightPanel := panelStyle.Width(rightWidth).Render(rightContent.String())
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
 }
 
 // k9s-style top bar with 3 panels (like k9s)
+// Optimized for iTerm and macOS Terminal compatibility
 func (m model) renderTopBarK9sStyle() string {
 	// Three panel layout matching k9s style
+	// iTerm optimization: Account for actual terminal width accurately
 	panelPadding := 4
 	availableWidth := m.width - panelPadding
+	// Ensure we have valid width for iTerm
+	if availableWidth < 100 {
+		availableWidth = 100
+	}
 	
 	// Left panel: Account/Context info (like k9s Context/Cluster/User)
+	// Give left panel more space to ensure all info is visible (minimum 50 chars)
 	leftWidth := availableWidth / 3
-	// Middle panel: Keybindings
+	if leftWidth < 50 {
+		leftWidth = 50
+	}
+	// iTerm-optimized: Middle panel for keybindings (minimum 25 chars for simple format)
 	middleWidth := availableWidth / 3
-	// Right panel: Logo/Regions
+	if middleWidth < 25 {
+		middleWidth = 25
+	}
+	// Right panel: Logo/Regions (remaining space)
 	rightWidth := availableWidth - leftWidth - middleWidth
+	if rightWidth < 30 {
+		rightWidth = 30
+		// Recalculate if we hit minimums - prioritize middle panel for keybindings
+		if leftWidth + middleWidth + rightWidth > availableWidth {
+			// Reduce left panel if needed, but keep middle panel at minimum
+			leftWidth = availableWidth - middleWidth - rightWidth
+			if leftWidth < 40 {
+				leftWidth = 40
+				// If still too wide, reduce right panel
+				if leftWidth + middleWidth + rightWidth > availableWidth {
+					rightWidth = availableWidth - leftWidth - middleWidth
+					if rightWidth < 20 {
+						rightWidth = 20
+					}
+				}
+			}
+		}
+	}
 
 	// Left panel - Context/Account info (k9s style)
 	var leftContent strings.Builder
@@ -1486,7 +1600,12 @@ func (m model) renderTopBarK9sStyle() string {
 	leftContent.WriteString("\n")
 	
 	if m.account != nil && m.currentView != "cluster-resources" {
-		email := truncateString(m.account.Email, leftWidth-12)
+		// Don't truncate email - show full email or use shorter label
+		email := m.account.Email
+		if len(email) > leftWidth-10 {
+			// If email is too long, show first part
+			email = email[:min(len(email), leftWidth-10)] + "..."
+		}
 		leftContent.WriteString(labelStyle.Render("Account: ") + valueStyle.Render(email))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Status: ") + valueStyle.Render(m.account.Status))
@@ -1499,49 +1618,57 @@ func (m model) renderTopBarK9sStyle() string {
 	}
 	leftContent.WriteString(labelStyle.Render("Refresh: ") + valueStyle.Render(refreshTime))
 	leftContent.WriteString("\n")
-	leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.0"))
+		leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.1.0"))
 
+	// iTerm-optimized: Better padding for left panel
 	leftPanel := lipgloss.NewStyle().
 		Width(leftWidth).
-		Padding(0, 1).
+		Padding(0, 2). // More padding for iTerm
 		Render(leftContent.String())
 
-	// Middle panel - Keybindings (k9s style)
+	// Middle panel - Keybindings (k9s style, optimized for iTerm)
+	// ALWAYS show 1, 2, n first - prioritize visibility
 	var middleContent strings.Builder
-	var keybindings []string
-	
-	if m.currentView == "cluster-resources" {
-		// Cluster resource view keybindings
-		keybindings = []string{
-			keyStyle.Render("<:>") + " Command",
-			keyStyle.Render("<d>") + " Next Resource",
-			keyStyle.Render("<n>") + " Namespace",
-			keyStyle.Render("<r>") + " Refresh",
-			keyStyle.Render("<enter>") + " Details",
-			keyStyle.Render("<esc>") + " Back",
-			keyStyle.Render("<q>") + " Quit",
-		}
-	} else {
-		// Main view keybindings
-		keybindings = []string{
-			keyStyle.Render("<1>") + " Droplets",
-			keyStyle.Render("<2>") + " Clusters",
-			keyStyle.Render("<n>") + " New",
-			keyStyle.Render("<r>") + " Refresh",
-			keyStyle.Render("<d>") + " Delete",
-			keyStyle.Render("<enter>") + " Details",
-			keyStyle.Render("<?>") + " Help",
-			keyStyle.Render("<q>") + " Quit",
-		}
-	}
-	
-	middleContent.WriteString(headerStyle.Render("Keybindings"))
+	middleContent.WriteString(headerStyle.Render("Keys"))
 	middleContent.WriteString("\n")
-	middleContent.WriteString(strings.Join(keybindings, "\n"))
+	
+	// iTerm-optimized: Simple format matching the desired output
+	// CRITICAL: Always show 1, 2, n first - simple format like "1 Droplets"
+	if m.currentView == "cluster-resources" {
+		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		middleContent.WriteString(keyStyle.Render(":") + " Command\n")
+		middleContent.WriteString(keyStyle.Render("d") + " Next\n")
+		middleContent.WriteString(keyStyle.Render("n") + " Namespace\n")
+		middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
+		middleContent.WriteString(keyStyle.Render("esc") + " Back\n")
+		middleContent.WriteString(keyStyle.Render("q") + " Quit")
+	} else if m.currentView == "droplets" {
+		// Droplets view - show 1, 2, n prominently (matching image format)
+		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		middleContent.WriteString(keyStyle.Render("n") + " New\n")
+		middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		middleContent.WriteString(keyStyle.Render("d") + " Delete\n")
+		middleContent.WriteString(keyStyle.Render("s") + " SSH\n")
+		middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
+		middleContent.WriteString(keyStyle.Render("?") + " Help\n")
+		middleContent.WriteString(keyStyle.Render("q") + " Quit")
+	} else {
+		// Clusters view
+		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		middleContent.WriteString(keyStyle.Render("enter") + " Enter\n")
+		middleContent.WriteString(keyStyle.Render("?") + " Help\n")
+		middleContent.WriteString(keyStyle.Render("q") + " Quit")
+	}
 
+	// iTerm-friendly padding and rendering
 	middlePanel := lipgloss.NewStyle().
 		Width(middleWidth).
-		Padding(0, 1).
+		Padding(0, 1). // Standard padding for iTerm
 		Render(middleContent.String())
 
 	// Right panel - Logo and Regions (k9s style)
@@ -1582,15 +1709,59 @@ func (m model) renderTopBarK9sStyle() string {
 func (m model) renderTopBarTwoPanelK9s() string {
 	panelPadding := 4
 	availableWidth := m.width - panelPadding
-	panelWidth := (availableWidth / 2) - 2
+	// iTerm optimization: Ensure valid width
+	if availableWidth < 70 {
+		availableWidth = 70
+	}
+	// Ensure left panel has minimum width for full visibility (minimum 45 chars)
+	leftPanelWidth := (availableWidth / 2) - 2
+	if leftPanelWidth < 45 {
+		leftPanelWidth = 45
+	}
+	rightPanelWidth := availableWidth - leftPanelWidth - 4
+	// iTerm-optimized: Ensure right panel has enough width (minimum 25 chars for simple format)
+	if rightPanelWidth < 25 {
+		rightPanelWidth = 25
+		leftPanelWidth = availableWidth - rightPanelWidth - 4
+		if leftPanelWidth < 40 {
+			// If left panel becomes too narrow, reduce right panel slightly but keep minimum
+			leftPanelWidth = 40
+			rightPanelWidth = availableWidth - leftPanelWidth - 4
+			if rightPanelWidth < 20 {
+				rightPanelWidth = 20 // Absolute minimum for iTerm
+			}
+		}
+	}
+	panelWidth := leftPanelWidth
 
-	// Left panel - Context info
+	// Left panel - Context info (ensure all info is visible)
 	var leftContent strings.Builder
 	leftContent.WriteString(labelStyle.Render("Context: ") + valueStyle.Render("DigitalOcean"))
 	leftContent.WriteString("\n")
-	leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedRegion))
-	leftContent.WriteString("\n")
-	leftContent.WriteString(labelStyle.Render("Droplets: ") + valueStyle.Render(fmt.Sprintf("%d", m.dropletCount)))
+	
+	if m.currentView == "cluster-resources" && m.selectedCluster != nil {
+		leftContent.WriteString(labelStyle.Render("Cluster: ") + valueStyle.Render(m.selectedCluster.Name))
+		leftContent.WriteString("\n")
+		leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedCluster.RegionSlug))
+		leftContent.WriteString("\n")
+		namespaceDisplay := "all"
+		if m.selectedNamespace != "" {
+			namespaceDisplay = m.selectedNamespace
+		}
+		leftContent.WriteString(labelStyle.Render("Namespace: ") + valueStyle.Render(namespaceDisplay))
+		leftContent.WriteString("\n")
+		leftContent.WriteString(labelStyle.Render("Resource: ") + valueStyle.Render(strings.Title(m.clusterResourceType)))
+		leftContent.WriteString("\n")
+		leftContent.WriteString(labelStyle.Render("Count: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.clusterResources))))
+	} else if m.currentView == "clusters" {
+		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Kubernetes Clusters"))
+		leftContent.WriteString("\n")
+		leftContent.WriteString(labelStyle.Render("Clusters: ") + valueStyle.Render(fmt.Sprintf("%d", m.clusterCount)))
+	} else {
+		leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedRegion))
+		leftContent.WriteString("\n")
+		leftContent.WriteString(labelStyle.Render("Droplets: ") + valueStyle.Render(fmt.Sprintf("%d", m.dropletCount)))
+	}
 	
 	refreshTime := "N/A"
 	if !m.lastRefresh.IsZero() {
@@ -1598,28 +1769,64 @@ func (m model) renderTopBarTwoPanelK9s() string {
 	}
 	leftContent.WriteString("\n")
 	leftContent.WriteString(labelStyle.Render("Refresh: ") + valueStyle.Render(refreshTime))
+	
+	if m.account != nil && m.currentView != "cluster-resources" {
+		leftContent.WriteString("\n")
+		leftContent.WriteString(labelStyle.Render("Status: ") + valueStyle.Render(m.account.Status))
+	}
 
+	// iTerm-optimized: Better padding for left panel
 	leftPanel := lipgloss.NewStyle().
 		Width(panelWidth).
-		Padding(0, 1).
+		Padding(0, 2). // More padding for iTerm
 		Render(leftContent.String())
 
-	// Right panel - Keybindings
+	// Right panel - Keybindings (optimized for iTerm)
+	// ALWAYS show view switching keys first - prioritize 1, 2, n
 	var rightContent strings.Builder
-	rightContent.WriteString(headerStyle.Render("Keybindings"))
+	rightContent.WriteString(headerStyle.Render("Keys"))
 	rightContent.WriteString("\n")
-	keybindings := []string{
-		keyStyle.Render("<n>") + " New",
-		keyStyle.Render("<r>") + " Refresh",
-		keyStyle.Render("<d>") + " Delete",
-		keyStyle.Render("<enter>") + " Details",
-		keyStyle.Render("<q>") + " Quit",
+	
+	// iTerm-optimized: Simple format matching the desired output
+	// CRITICAL: Always show 1, 2, n first - simple format like "1 Droplets"
+	if m.currentView == "droplets" {
+		// Droplets view - show 1, 2, n prominently (matching image format)
+		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		rightContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		rightContent.WriteString(keyStyle.Render("n") + " New\n")
+		rightContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		rightContent.WriteString(keyStyle.Render("d") + " Delete\n")
+		rightContent.WriteString(keyStyle.Render("s") + " SSH\n")
+		rightContent.WriteString(keyStyle.Render("enter") + " Details\n")
+		rightContent.WriteString(keyStyle.Render("?") + " Help\n")
+		rightContent.WriteString(keyStyle.Render("q") + " Quit")
+	} else if m.currentView == "clusters" {
+		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		rightContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		rightContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		rightContent.WriteString(keyStyle.Render("enter") + " Enter\n")
+		rightContent.WriteString(keyStyle.Render("q") + " Quit")
+	} else {
+		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		rightContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		rightContent.WriteString(keyStyle.Render(":") + " Command\n")
+		rightContent.WriteString(keyStyle.Render("d") + " Next\n")
+		rightContent.WriteString(keyStyle.Render("n") + " Namespace\n")
+		rightContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		rightContent.WriteString(keyStyle.Render("esc") + " Back\n")
+		rightContent.WriteString(keyStyle.Render("q") + " Quit")
 	}
-	rightContent.WriteString(strings.Join(keybindings, "\n"))
 
+	// iTerm-optimized: Ensure panel has enough width (minimum 25 chars for simple format)
+	minWidth := 25
+	if rightPanelWidth < minWidth {
+		rightPanelWidth = minWidth
+	}
+	
+	// iTerm-friendly padding and rendering
 	rightPanel := lipgloss.NewStyle().
-		Width(panelWidth).
-		Padding(0, 1).
+		Width(rightPanelWidth).
+		Padding(0, 1). // Standard padding for iTerm
 		Render(rightContent.String())
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
@@ -1634,7 +1841,15 @@ func (m model) renderTopBarCompactK9s() string {
 	s.WriteString(" | ")
 	s.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedRegion))
 	s.WriteString("\n")
-	s.WriteString(keyStyle.Render("<n>") + " New | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<d>") + " Delete | " + keyStyle.Render("<q>") + " Quit")
+	var keybindings string
+	if m.currentView == "droplets" {
+		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<n>") + " New | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<d>") + " Delete | " + keyStyle.Render("<s>") + " SSH | " + keyStyle.Render("<q>") + " Quit"
+	} else if m.currentView == "clusters" {
+		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<enter>") + " Enter | " + keyStyle.Render("<q>") + " Quit"
+	} else {
+		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<:>") + " Command | " + keyStyle.Render("<d>") + " Next | " + keyStyle.Render("<n>") + " Namespace | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<esc>") + " Back | " + keyStyle.Render("<q>") + " Quit"
+	}
+	s.WriteString(keybindings)
 	return s.String()
 }
 
@@ -1688,7 +1903,7 @@ func (m model) renderTopBarThreePanel() string {
 	leftPanelContent := accountInfo.String()
 	// CRITICAL: Ensure content is not empty
 	if strings.TrimSpace(leftPanelContent) == "" {
-		leftPanelContent = fmt.Sprintf("DigitalOcean\n\nDroplets: %d\nRegion: %s\nRefresh: N/A\nVersion: dogoctl v1.0",
+		leftPanelContent = fmt.Sprintf("DigitalOcean\n\nDroplets: %d\nRegion: %s\nRefresh: N/A\nVersion: dogoctl v1.1.0",
 			m.dropletCount, m.selectedRegion)
 	}
 	// Render with proper width - ensure content is visible
@@ -1762,7 +1977,7 @@ func (m model) renderTopBarVertical() string {
 	s.WriteString("\n")
 	s.WriteString(labelStyle.Render("Refresh: ") + valueStyle.Render(refreshTime))
 	s.WriteString(" | ")
-	s.WriteString(keyStyle.Render("n") + " New | " + keyStyle.Render("r") + " Refresh | " + keyStyle.Render("d") + " Delete | " + keyStyle.Render("q") + " Quit")
+	s.WriteString(keyStyle.Render("n") + " New | " + keyStyle.Render("r") + " Refresh | " + keyStyle.Render("d") + " Delete | " + keyStyle.Render("s") + " SSH | " + keyStyle.Render("q") + " Quit")
 	result := s.String()
 	// Ensure we return something
 	if strings.TrimSpace(result) == "" {
@@ -2544,6 +2759,26 @@ func deleteDroplet(client *godo.Client, id int) tea.Cmd {
 	}
 }
 
+// executeSSH executes an SSH connection to the droplet
+// This should be called after the tea program exits
+func executeSSH(ip, name string) error {
+	fmt.Printf("\n🔌 Connecting to %s (%s)...\n\n", name, ip)
+	
+	// SSH command
+	cmd := exec.Command("ssh", ip)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	
+	// Execute SSH (this will block until SSH session ends)
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("SSH connection to %s (%s) failed: %v", name, ip, err)
+	}
+	
+	return nil
+}
+
 func main() {
 	token := os.Getenv("DO_TOKEN")
 	if token == "" {
@@ -2556,11 +2791,36 @@ func main() {
 	oauthClient := oauth2.NewClient(context.Background(), tokenSource)
 	client := godo.NewClient(oauthClient)
 
-	m := initialModel(client)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	// Main loop: restart TUI after SSH sessions
+	// iTerm optimization: Use standard output and ensure proper terminal detection
+	for {
+		m := initialModel(client)
+		// iTerm-optimized: Ensure proper terminal capabilities
+		// iTerm optimization: Use standard alt screen, bubbletea handles terminal detection
+		p := tea.NewProgram(m, tea.WithAltScreen())
 
-	if err := p.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
-		os.Exit(1)
+		if err := p.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
+			os.Exit(1)
+		}
+		
+		// If SSH was requested, execute it now (after program exits)
+		if sshIP != "" {
+			ip := sshIP
+			name := sshName
+			// Clear SSH info before executing (so we can restart TUI after)
+			sshIP = ""
+			sshName = ""
+			
+			if err := executeSSH(ip, name); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				// Continue loop to restart TUI even if SSH fails
+			}
+			// After SSH exits, continue loop to restart TUI
+			continue
+		}
+		
+		// If no SSH was requested, exit normally
+		break
 	}
 }

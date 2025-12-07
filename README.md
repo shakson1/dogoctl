@@ -4,7 +4,7 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets an
 
 ![dogoctl](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 
 ## ✨ Features
 
@@ -13,6 +13,7 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets an
 - 📋 **List Droplets**: View all your droplets with status indicators, region, size, and IP information
 - ➕ **Create Droplets**: Interactive form with helpful hints to create new droplets
 - 🗑️ **Delete Droplets**: Safe deletion with confirmation dialogs
+- 🔌 **SSH Connection**: Quick SSH access to droplets directly from the TUI
 - 🔄 **Real-time Refresh**: Reload droplet list with loading indicators
 - 🎨 **Color-coded Status**: Visual indicators for droplet status (● active, ○ off, ◐ new)
 - 📊 **Status Bar**: Shows droplet count and last refresh time
@@ -109,6 +110,7 @@ do-droplets
 | `n` | Create a new droplet |
 | `r` | Refresh the current view |
 | `d` | Delete selected droplet (with confirmation) |
+| `s` | SSH into selected droplet |
 | `<enter>` | View droplet/cluster details |
 | `<0-9>` | Filter by region (0 = all) |
 | `↑/↓` | Navigate through items |
@@ -181,6 +183,32 @@ Press `<esc>` to cancel command mode.
 4. Each field shows helpful hints when focused
 5. Press `Enter` on the last field to create the droplet
 6. Press `Esc` to cancel
+
+## 🔌 SSH Connection
+
+### Connecting to a Droplet
+
+1. Select a droplet from the list using `↑/↓` arrow keys
+2. Press `s` to SSH into the selected droplet
+3. The TUI will exit and open an SSH session to the droplet's IP address
+4. When you exit the SSH session (type `exit` or press `Ctrl+D`), you'll return to your shell
+
+### Requirements
+
+- The droplet must be in `active` status
+- The droplet must have an IPv4 address assigned
+- SSH must be configured on your system (the `ssh` command must be available)
+- Your SSH keys must be set up for the droplet (either via DigitalOcean's key management or manually)
+
+### Troubleshooting SSH
+
+- **"droplet has no IP address"**: The droplet may still be provisioning. Wait a few moments and refresh (`r`)
+- **"droplet is not active"**: The droplet must be running. Check the status in the TUI
+- **"SSH connection failed"**: 
+  - Verify your SSH keys are added to the droplet
+  - Check that the droplet's firewall allows SSH (port 22)
+  - Ensure your local SSH configuration is correct
+  - Try connecting manually: `ssh root@<droplet-ip>`
 
 ## ☸️ Managing Kubernetes Clusters
 
@@ -341,6 +369,14 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 For issues, questions, or contributions, please open an issue on GitHub.
 
 ## 📋 Changelog
+
+### v1.1.0 (2024)
+- SSH connection support for droplets
+- iTerm terminal optimization and compatibility
+- Improved keybindings visibility (1, 2, n always shown)
+- Enhanced top bar rendering for all terminal sizes
+- Better terminal width detection and fallback handling
+- Optimized panel layouts for consistent rendering across terminals
 
 ### v1.0.0 (2024)
 - Initial release
