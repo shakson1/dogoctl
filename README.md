@@ -1,12 +1,14 @@
-# 🐳 dogoctl - DigitalOcean Droplet Manager
+# 🐳 dogoctl - DigitalOcean Droplet & Kubernetes Manager
 
-A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets, inspired by k9s. Create, list, and manage your droplets with a modern command-line interface.
+A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets and Kubernetes clusters, inspired by k9s. Create, list, and manage your droplets and Kubernetes resources with a modern command-line interface.
 
 ![dogoctl](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue)
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
 
 ## ✨ Features
 
+### Droplet Management
 - 🖥️ **Interactive TUI**: Navigate and manage droplets with intuitive keyboard shortcuts
 - 📋 **List Droplets**: View all your droplets with status indicators, region, size, and IP information
 - ➕ **Create Droplets**: Interactive form with helpful hints to create new droplets
@@ -14,9 +16,18 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets, i
 - 🔄 **Real-time Refresh**: Reload droplet list with loading indicators
 - 🎨 **Color-coded Status**: Visual indicators for droplet status (● active, ○ off, ◐ new)
 - 📊 **Status Bar**: Shows droplet count and last refresh time
-- 🔍 **Search/Filter**: Quickly find droplets by name
-- 📱 **Responsive Layout**: Adapts to terminal window size
+- 🔍 **Region Filtering**: Filter droplets by region
+- 📱 **Responsive Layout**: Adapts to terminal window size dynamically
 - ⚡ **Loading States**: Visual feedback during API operations
+
+### Kubernetes Cluster Management
+- ☸️ **Kubernetes Clusters**: View and manage DigitalOcean Kubernetes clusters
+- 📦 **Resource Types**: Browse deployments, pods, services, daemonsets, statefulsets, PVCs, configmaps, secrets, nodes, and namespaces
+- 🔄 **Command Mode**: Quick resource switching using `:` command (e.g., `:configmaps`)
+- 🏷️ **Namespace Filtering**: Filter resources by namespace or view all namespaces
+- 📊 **Cluster Info**: Display cluster details, version, region, and resource counts in the top panel
+- 🔍 **Resource Details**: View detailed information about Kubernetes resources
+- ⚡ **Real-time Updates**: Refresh cluster resources with loading indicators
 
 ## 📸 Screenshots
 
@@ -25,11 +36,14 @@ The interface features:
 - Clean, modern design with rounded borders
 - Contextual help and hints
 - Smooth animations and transitions
+- k9s-inspired multi-panel layout
+- Dynamic responsive design
 
 ## 🚀 Prerequisites
 
 - Go 1.24 or later
 - DigitalOcean API token
+- Kubernetes clusters (for Kubernetes features)
 
 ## 📦 Installation
 
@@ -87,16 +101,52 @@ do-droplets
 
 ## ⌨️ Keyboard Shortcuts
 
-### Main View
+### Main View (Droplets)
 | Key | Action |
 |-----|--------|
+| `<1>` | Switch to Droplets view |
+| `<2>` | Switch to Kubernetes Clusters view |
 | `n` | Create a new droplet |
-| `r` | Refresh the droplet list |
+| `r` | Refresh the current view |
 | `d` | Delete selected droplet (with confirmation) |
-| `enter` | View droplet details |
-| `/` | Filter/search droplets |
-| `↑/↓` | Navigate through droplets |
+| `<enter>` | View droplet/cluster details |
+| `<0-9>` | Filter by region (0 = all) |
+| `↑/↓` | Navigate through items |
 | `q` | Quit the application |
+
+### Kubernetes Clusters View
+| Key | Action |
+|-----|--------|
+| `<enter>` | Enter cluster and view resources |
+| `<esc>` | Go back to clusters list |
+| `r` | Refresh clusters list |
+| `q` | Quit |
+
+### Cluster Resources View
+| Key | Action |
+|-----|--------|
+| `:` | Enter command mode (type resource name) |
+| `d` | Cycle through resource types |
+| `n` | Switch namespace (toggle all/specific) |
+| `r` | Refresh resources |
+| `<enter>` | View resource details |
+| `<esc>` | Go back to clusters list |
+| `q` | Quit |
+
+### Command Mode (`:`)
+Type resource name and press `<enter>` to switch:
+- `deployments` - View deployments
+- `pods` - View pods
+- `services` - View services
+- `daemonsets` - View daemonsets
+- `statefulsets` - View statefulsets
+- `pvc` - View PersistentVolumeClaims
+- `configmaps` - View ConfigMaps
+- `secrets` - View Secrets
+- `nodes` - View nodes
+- `namespaces` - View namespaces
+
+Press `<esc>` to cancel command mode.
 
 ### Create Form
 | Key | Action |
@@ -132,6 +182,33 @@ do-droplets
 5. Press `Enter` on the last field to create the droplet
 6. Press `Esc` to cancel
 
+## ☸️ Managing Kubernetes Clusters
+
+### Viewing Cluster Resources
+
+1. Press `<2>` to switch to Kubernetes Clusters view
+2. Select a cluster and press `<enter>`
+3. View resources by:
+   - Pressing `:` and typing resource name (e.g., `:configmaps`)
+   - Pressing `d` to cycle through resource types
+4. Filter by namespace:
+   - Press `n` to view namespaces
+   - Select a namespace and press `<enter>`
+   - Press `n` again to clear filter (show all)
+
+### Available Resource Types
+
+- **Deployments**: NAME, READY, UP-TO-DATE, AVAILABLE, AGE
+- **Pods**: NAME, READY, STATUS, RESTARTS, AGE
+- **Services**: NAME, TYPE, CLUSTER-IP, EXTERNAL-IP, AGE
+- **DaemonSets**: NAME, READY, CURRENT, AGE
+- **StatefulSets**: NAME, READY, AGE
+- **PVC**: NAME, STATUS, CAPACITY, AGE
+- **ConfigMaps**: NAME, DATA, AGE
+- **Secrets**: NAME, TYPE, DATA, AGE
+- **Nodes**: NAME, STATUS, ROLES, AGE, VERSION
+- **Namespaces**: NAME, STATUS, AGE
+
 ## 🌍 Common DigitalOcean Values
 
 ### Regions
@@ -166,6 +243,18 @@ export DO_TOKEN=dop_v1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Run the application
 ./do-droplets
+
+# Switch to clusters view
+# Press <2>
+
+# Enter a cluster
+# Press <enter> on a cluster
+
+# View configmaps using command mode
+# Press : then type "configmaps" and press <enter>
+
+# Filter by namespace
+# Press <n> to view namespaces, select one, press <enter>
 ```
 
 ## 🐛 Troubleshooting
@@ -181,6 +270,11 @@ export DO_TOKEN=your_token_here
 - Check your internet connection
 - Ensure you have sufficient API rate limits
 - Verify your token has read/write permissions
+
+### Kubernetes cluster access errors
+- Ensure your DigitalOcean account has access to Kubernetes clusters
+- Verify the cluster is running and accessible
+- Check that the kubeconfig can be retrieved from DigitalOcean
 
 ### Build errors
 Make sure all dependencies are installed:
@@ -208,6 +302,7 @@ Recommended terminals:
 - [Bubbletea](https://github.com/charmbracelet/bubbletea) - TUI framework
 - [Lipgloss](https://github.com/charmbracelet/lipgloss) - Styling
 - [DigitalOcean Go SDK](https://github.com/digitalocean/godo) - DigitalOcean API client
+- [Kubernetes client-go](https://github.com/kubernetes/client-go) - Kubernetes API client
 
 ### Building from Source
 ```bash
@@ -244,6 +339,18 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## 📞 Support
 
 For issues, questions, or contributions, please open an issue on GitHub.
+
+## 📋 Changelog
+
+### v1.0.0 (2024)
+- Initial release
+- Droplet management (list, create, delete)
+- Kubernetes cluster management
+- Resource type browsing (deployments, pods, services, etc.)
+- Command mode for quick resource switching
+- Namespace filtering
+- Responsive TUI design
+- Region filtering for droplets
 
 ---
 
