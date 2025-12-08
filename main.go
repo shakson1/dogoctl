@@ -32,41 +32,54 @@ func (t *TokenSource) Token() (*oauth2.Token, error) {
 }
 
 type model struct {
-	table            table.Model
-	client           *godo.Client
-	droplets         []godo.Droplet
-	clusters         []*godo.KubernetesCluster
-	clusterResources []map[string]interface{} // Resources from selected cluster
-	account          *godo.Account
-	creating         bool
-	viewingDetails   bool
-	confirmDelete    bool
-	deleteTargetID   int
-	deleteTargetName string
-	loading          bool
-	spinner          spinner.Model
-	selectedDroplet  *godo.Droplet
-	selectedCluster  *godo.KubernetesCluster
-	currentView      string // "droplets", "clusters", or "cluster-resources"
+	table               table.Model
+	client              *godo.Client
+	droplets            []godo.Droplet
+	clusters            []*godo.KubernetesCluster
+	clusterResources    []map[string]interface{} // Resources from selected cluster
+	account             *godo.Account
+	creating            bool
+	viewingDetails      bool
+	confirmDelete       bool
+	deleteTargetID      int
+	deleteTargetName    string
+	loading             bool
+	spinner             spinner.Model
+	selectedDroplet     *godo.Droplet
+	selectedCluster     *godo.KubernetesCluster
+	currentView         string // "droplets", "clusters", or "cluster-resources"
 	clusterResourceType string // "deployments", "pods", "services", "nodes", etc.
-	selectedNamespace string // Current namespace filter (empty = all namespaces)
-	commandMode      bool   // Command input mode (like k9s :command)
-	commandInput     textinput.Model
-	nameInput        textinput.Model
-	regionInput      textinput.Model
-	sizeInput        textinput.Model
-	imageInput       textinput.Model
-	tagsInput        textinput.Model
-	inputIndex       int
-	err              error
-	successMsg       string
-	dropletCount     int
-	clusterCount     int
-	lastRefresh      time.Time
-	selectedRegion   string
-	regions          []string
-	width            int
-	height           int
+	selectedNamespace   string // Current namespace filter (empty = all namespaces)
+	commandMode         bool   // Command input mode (like k9s :command)
+	commandInput        textinput.Model
+	nameInput           textinput.Model
+	regionInput         textinput.Model
+	sizeInput           textinput.Model
+	imageInput          textinput.Model
+	tagsInput           textinput.Model
+	inputIndex          int
+	err                 error
+	successMsg          string
+	dropletCount        int
+	clusterCount        int
+	lastRefresh         time.Time
+	selectedRegion      string
+	regions             []string
+	width               int
+	height              int
+	selectingSSHIP      bool   // When true, show IP selection menu for SSH
+	sshIPType           string // "public" or "private" - selected IP type for SSH
+	// Create form selection state
+	selectingRegion    bool // When true, show region selection table
+	selectingSize      bool // When true, show size selection table
+	selectingImage     bool // When true, show image selection table
+	availableRegions   []godo.Region
+	availableSizes     []godo.Size
+	availableImages    []godo.Image
+	selectedRegionSlug string      // Selected region slug for creation
+	selectedSizeSlug   string      // Selected size slug for creation
+	selectedImageSlug  string      // Selected image slug for creation
+	selectionTable     table.Model // Table for selecting region/size/image
 }
 
 type errMsg error
@@ -81,6 +94,15 @@ type dropletDeletedMsg struct{}
 type accountInfoMsg struct {
 	account *godo.Account
 }
+type regionsLoadedMsg []godo.Region
+type sizesLoadedMsg []godo.Size
+type imagesLoadedMsg []godo.Image
+
+const (
+	viewDroplets         = "droplets"
+	viewClusters         = "clusters"
+	viewClusterResources = "cluster-resources"
+)
 
 var (
 	// Colors matching k9s style
@@ -92,7 +114,7 @@ var (
 	bgColor        = lipgloss.Color("235") // dark gray
 	borderColor    = lipgloss.Color("39")  // cyan
 	highlightColor = lipgloss.Color("226") // yellow for highlights
-	
+
 	// SSH connection info (set when user wants to SSH)
 	sshIP   string
 	sshName string
@@ -208,37 +230,67 @@ func initialModel(client *godo.Client) model {
 	sp.Style = lipgloss.NewStyle().Foreground(primaryColor)
 
 	return model{
-		table:           t,
-		client:          client,
-		droplets:        []godo.Droplet{},
-		clusters:        []*godo.KubernetesCluster{},
-		clusterResources: []map[string]interface{}{},
-		account:         nil,
-		creating:        false,
-		viewingDetails:  false,
-		confirmDelete:   false,
-		loading:         false,
-		spinner:         sp,
-		selectedDroplet: nil,
-		selectedCluster: nil,
-		currentView:     "droplets", // Start with droplets view
+		table:               t,
+		client:              client,
+		droplets:            []godo.Droplet{},
+		clusters:            []*godo.KubernetesCluster{},
+		clusterResources:    []map[string]interface{}{},
+		account:             nil,
+		creating:            false,
+		viewingDetails:      false,
+		confirmDelete:       false,
+		loading:             false,
+		spinner:             sp,
+		selectedDroplet:     nil,
+		selectedCluster:     nil,
+		currentView:         viewDroplets,  // Start with droplets view
 		clusterResourceType: "deployments", // Default resource type when entering cluster
-		selectedNamespace: "", // Empty = all namespaces
-		commandMode:      false,
-		commandInput:     commandInput,
-		nameInput:       nameInput,
-		regionInput:     regionInput,
-		sizeInput:       sizeInput,
-		imageInput:      imageInput,
-		tagsInput:       tagsInput,
-		inputIndex:      0,
-		dropletCount:    0,
-		clusterCount:    0,
-		lastRefresh:     time.Now(),
-		selectedRegion:  "all",
-		regions:         []string{"all"},
-		width:           120,
-		height:          40,
+		selectedNamespace:   "",            // Empty = all namespaces
+		commandMode:         false,
+		commandInput:        commandInput,
+		nameInput:           nameInput,
+		regionInput:         regionInput,
+		sizeInput:           sizeInput,
+		imageInput:          imageInput,
+		tagsInput:           tagsInput,
+		inputIndex:          0,
+		dropletCount:        0,
+		clusterCount:        0,
+		lastRefresh:         time.Now(),
+		selectedRegion:      "all",
+		regions:             []string{"all"},
+		width:               120,
+		height:              40,
+		selectingSSHIP:      false,
+		sshIPType:           "public",
+		selectingRegion:     false,
+		selectingSize:       false,
+		selectingImage:      false,
+		availableRegions:    []godo.Region{},
+		availableSizes:      []godo.Size{},
+		availableImages:     []godo.Image{},
+		selectedRegionSlug:  "",
+		selectedSizeSlug:    "",
+		selectedImageSlug:   "",
+		selectionTable: func() table.Model {
+			selTable := table.New(
+				table.WithFocused(true),
+				table.WithHeight(10),
+			)
+			selStyles := table.DefaultStyles()
+			selStyles.Header = selStyles.Header.
+				BorderStyle(lipgloss.NormalBorder()).
+				BorderForeground(borderColor).
+				BorderBottom(true).
+				Bold(true).
+				Foreground(primaryColor)
+			selStyles.Selected = selStyles.Selected.
+				Foreground(lipgloss.Color("229")).
+				Background(lipgloss.Color("57")).
+				Bold(true)
+			selTable.SetStyles(selStyles)
+			return selTable
+		}(),
 	}
 }
 
@@ -264,6 +316,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateCommandMode(msg)
 		}
 
+		// Handle SSH IP selection menu
+		if m.selectingSSHIP {
+			return m.updateSSHIPSelection(msg)
+		}
+
 		if m.confirmDelete {
 			return m.updateDeleteConfirmation(msg)
 		}
@@ -274,6 +331,48 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.viewingDetails {
 			switch msg.String() {
+			case "s", "S":
+				// SSH into droplet from details view
+				if m.selectedDroplet != nil {
+					d := m.selectedDroplet
+					// Check if droplet is active
+					if d.Status != "active" {
+						m.err = fmt.Errorf("droplet %s is not active (status: %s)", d.Name, d.Status)
+						return m, nil
+					}
+
+					publicIP := getPublicIP(*d)
+					privateIP := getPrivateIP(*d)
+
+					if publicIP == "" && privateIP == "" {
+						m.err = fmt.Errorf("droplet %s has no IP address", d.Name)
+						return m, nil
+					}
+
+					// If both IPs exist, show selection menu
+					if publicIP != "" && privateIP != "" {
+						m.selectingSSHIP = true
+						m.viewingDetails = false // Exit details view to show SSH selection menu
+						return m, nil
+					}
+
+					// If only one IP type exists, use it directly
+					var ip string
+					if publicIP != "" {
+						ip = publicIP
+					} else {
+						ip = privateIP
+					}
+
+					// Store SSH info and exit program
+					sshIP = ip
+					sshName = d.Name
+					return m, tea.Sequence(
+						tea.ExitAltScreen,
+						tea.Quit,
+					)
+				}
+				return m, nil
 			case "esc", "enter", "backspace":
 				m.viewingDetails = false
 				m.selectedDroplet = nil
@@ -287,7 +386,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case ":":
 			// Enter command mode (only in cluster-resources view)
-			if m.currentView == "cluster-resources" {
+			if m.currentView == viewClusterResources {
 				m.commandMode = true
 				m.commandInput.Focus()
 				m.commandInput.SetValue("")
@@ -302,20 +401,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "1":
 			// Switch to droplets view
-			m.currentView = "droplets"
+			m.currentView = viewDroplets
 			m.loading = true
 			// Update table immediately with droplet columns
 			m.updateTableRows()
 			return m, tea.Batch(loadDroplets(m.client), m.spinner.Tick)
 		case "2":
 			// Switch to clusters view
-			m.currentView = "clusters"
+			m.currentView = viewClusters
 			m.loading = true
 			// Update table immediately with cluster columns
 			m.updateTableRows()
 			return m, tea.Batch(loadClusters(m.client), m.spinner.Tick)
 		case "n", "N":
-			if m.currentView == "cluster-resources" {
+			if m.currentView == viewClusterResources {
 				// Switch namespace - if viewing namespaces, select one; otherwise toggle all/specific
 				if m.clusterResourceType == "namespaces" {
 					// If viewing namespaces list, select the highlighted namespace
@@ -344,26 +443,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, tea.Batch(loadClusterResources(m.client, m.selectedCluster, m.clusterResourceType, ""), m.spinner.Tick)
 					}
 				}
-			} else if m.currentView == "droplets" {
+			} else if m.currentView == viewDroplets {
 				m.creating = true
 				m.inputIndex = 0
 				m.nameInput.Focus()
 				m.err = nil
 				m.successMsg = ""
-				return m, nil
+				// Reset selection state
+				m.selectingRegion = false
+				m.selectingSize = false
+				m.selectingImage = false
+				m.selectedRegionSlug = ""
+				m.selectedSizeSlug = ""
+				m.selectedImageSlug = ""
+				// Load regions, sizes, and images when opening create form
+				return m, tea.Batch(
+					loadRegions(m.client),
+					loadSizes(m.client),
+					loadImages(m.client),
+				)
 			}
 		case "r", "R":
 			m.loading = true
-			if m.currentView == "droplets" {
+			if m.currentView == viewDroplets {
 				return m, tea.Batch(loadDroplets(m.client), m.spinner.Tick)
-			} else if m.currentView == "cluster-resources" {
+			} else if m.currentView == viewClusterResources {
 				return m, tea.Batch(loadClusterResources(m.client, m.selectedCluster, m.clusterResourceType, m.selectedNamespace), m.spinner.Tick)
 			} else {
 				return m, tea.Batch(loadClusters(m.client), m.spinner.Tick)
 			}
 		case "d", "D":
 			// Switch resource types in cluster view, or delete in droplets view
-			if m.currentView == "cluster-resources" {
+			if m.currentView == viewClusterResources {
 				resourceTypes := []string{"deployments", "pods", "services", "daemonsets", "statefulsets", "pvc", "configmaps", "secrets", "nodes", "namespaces"}
 				currentIdx := -1
 				for i, rt := range resourceTypes {
@@ -379,7 +490,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.updateTableRows()
 					return m, tea.Batch(loadClusterResources(m.client, m.selectedCluster, m.clusterResourceType, m.selectedNamespace), m.spinner.Tick)
 				}
-			} else if m.currentView == "droplets" {
+			} else if m.currentView == viewDroplets {
 				if m.table.SelectedRow() != nil && len(m.table.SelectedRow()) > 0 {
 					// Find droplet by name
 					selectedName := m.table.SelectedRow()[0]
@@ -395,29 +506,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "s", "S":
-			// SSH into selected droplet
-			if m.currentView == "droplets" {
+			// SSH into selected droplet - show IP selection menu
+			if m.currentView == viewDroplets {
 				if m.table.SelectedRow() != nil && len(m.table.SelectedRow()) > 0 {
 					selectedName := m.table.SelectedRow()[0]
 					for _, d := range m.droplets {
 						if d.Name == selectedName {
-							// Get IP address
-							var ip string
-							if len(d.Networks.V4) > 0 {
-								ip = d.Networks.V4[0].IPAddress
-							}
-							
-							if ip == "" {
-								m.err = fmt.Errorf("droplet %s has no IP address", d.Name)
-								return m, nil
-							}
-							
 							// Check if droplet is active
 							if d.Status != "active" {
 								m.err = fmt.Errorf("droplet %s is not active (status: %s)", d.Name, d.Status)
 								return m, nil
 							}
-							
+
+							publicIP := getPublicIP(d)
+							privateIP := getPrivateIP(d)
+
+							if publicIP == "" && privateIP == "" {
+								m.err = fmt.Errorf("droplet %s has no IP address", d.Name)
+								return m, nil
+							}
+
+							// If both IPs exist, show selection menu
+							if publicIP != "" && privateIP != "" {
+								m.selectingSSHIP = true
+								m.selectedDroplet = &d
+								m.sshIPType = "public" // Default to public
+								return m, nil
+							}
+
+							// If only one IP type exists, use it directly
+							var ip string
+							if publicIP != "" {
+								ip = publicIP
+							} else {
+								ip = privateIP
+							}
+
 							// Store SSH info and exit program
 							sshIP = ip
 							sshName = d.Name
@@ -433,7 +557,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.table.SelectedRow() != nil && len(m.table.SelectedRow()) > 0 {
 				selectedName := m.table.SelectedRow()[0]
-				if m.currentView == "droplets" {
+				if m.currentView == viewDroplets {
 					for i := range m.droplets {
 						if m.droplets[i].Name == selectedName {
 							m.viewingDetails = true
@@ -442,21 +566,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							break
 						}
 					}
-				} else if m.currentView == "clusters" {
+				} else if m.currentView == viewClusters {
 					// Enter cluster - show resource types menu
 					for i := range m.clusters {
 						if m.clusters[i].Name == selectedName {
-							m.currentView = "cluster-resources"
+							m.currentView = viewClusterResources
 							m.selectedCluster = m.clusters[i]
 							m.selectedDroplet = nil
 							m.clusterResourceType = "deployments" // Default to deployments
-							m.selectedNamespace = "" // Start with all namespaces
+							m.selectedNamespace = ""              // Start with all namespaces
 							m.loading = true
 							m.updateTableRows()
 							return m, tea.Batch(loadClusterResources(m.client, m.clusters[i], "deployments", ""), m.spinner.Tick)
 						}
 					}
-				} else if m.currentView == "cluster-resources" && m.clusterResourceType == "namespaces" {
+				} else if m.currentView == viewClusterResources && m.clusterResourceType == "namespaces" {
 					// Select namespace when viewing namespaces
 					if selectedName == "all" {
 						m.selectedNamespace = ""
@@ -473,13 +597,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "0":
-			if m.currentView == "droplets" {
+			if m.currentView == viewDroplets {
 				m.selectedRegion = "all"
 				m.updateTableRows()
 			}
 			return m, nil
 		case "3", "4", "5", "6", "7", "8", "9":
-			if m.currentView == "droplets" {
+			if m.currentView == viewDroplets {
 				idx, _ := strconv.Atoi(msg.String())
 				if idx > 0 && idx <= len(m.regions) {
 					m.selectedRegion = m.regions[idx-1]
@@ -489,8 +613,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "esc":
 			// Go back from cluster resources to clusters list
-			if m.currentView == "cluster-resources" {
-				m.currentView = "clusters"
+			if m.currentView == viewClusterResources {
+				m.currentView = viewClusters
 				m.selectedCluster = nil
 				m.updateTableRows()
 				return m, nil
@@ -558,6 +682,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.account = msg.account
 		return m, nil
 
+	case regionsLoadedMsg:
+		m.availableRegions = msg
+		return m, nil
+
+	case sizesLoadedMsg:
+		m.availableSizes = msg
+		return m, nil
+
+	case imagesLoadedMsg:
+		m.availableImages = msg
+		return m, nil
+
 	case dropletCreatedMsg:
 		m.creating = false
 		m.successMsg = fmt.Sprintf("✅ Droplet '%s' created successfully! (ID: %d)", msg.Name, msg.ID)
@@ -613,7 +749,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if !m.loading && !m.creating && !m.viewingDetails && !m.confirmDelete {
+	if !m.loading && !m.creating && !m.viewingDetails && !m.confirmDelete && !m.selectingSSHIP {
 		m.table, cmd = m.table.Update(msg)
 		cmds = append(cmds, cmd)
 	}
@@ -662,8 +798,10 @@ func (m *model) updateTableDimensions(width, height int) {
 	m.table.SetWidth(tableWidth)
 	m.table.SetHeight(tableHeight)
 
-	// Update column widths based on available space
-	m.updateColumnWidths(tableWidth)
+	// Update column widths based on available space (only for droplets view)
+	if m.currentView == viewDroplets {
+		m.updateColumnWidths(tableWidth)
+	}
 }
 
 func (m *model) updateInputWidths(width int) {
@@ -697,15 +835,15 @@ func (m *model) getTopBarHeight(width int) int {
 
 func (m *model) updateColumnWidths(totalWidth int) {
 	// Skip column width calculation if we're in clusters view - columns are set in updateTableRows
-	if m.currentView == "clusters" {
+	if m.currentView == viewClusters {
 		return
 	}
-	
+
 	// Minimum column widths (optimized for small screens)
-	// STATUS needs more width to show full status text like "ACTIVE"
+	// STATUS needs more width to show full status text like "● ACTIVE"
 	minWidths := map[string]int{
 		"NAME":   8,
-		"STATUS": 10, // Increased to show full status like "● ACTIVE"
+		"STATUS": 12, // Increased to show full status like "● ACTIVE" (icon + space + text)
 		"REGION": 5,
 		"SIZE":   7,
 		"IP":     9,
@@ -763,24 +901,42 @@ func (m *model) updateColumnWidths(totalWidth int) {
 		}
 
 		if total > availableWidth {
-			// Reduce from least important columns first (IMAGE, then SIZE)
+			// Reduce from least important columns first
+			// Column indices: 0=NAME, 1=STATUS, 2=REGION, 3=SIZE, 4=IP, 5=IMAGE, 6=AGE
+			// Priority: Reduce AGE (6), then IMAGE (5), then SIZE (3), protect STATUS (1)
 			excess := total - availableWidth
 			for excess > 0 {
 				reduced := false
-				if columns[6].Width > minWidths["IMAGE"] {
-					reduce := min(excess, columns[6].Width-minWidths["IMAGE"])
+				// Try reducing AGE first (least important)
+				if excess > 0 && columns[6].Width > minWidths["AGE"] {
+					reduce := min(excess, columns[6].Width-minWidths["AGE"])
 					columns[6].Width -= reduce
 					excess -= reduce
 					reduced = true
 				}
+				// Then reduce IMAGE
+				if excess > 0 && columns[5].Width > minWidths["IMAGE"] {
+					reduce := min(excess, columns[5].Width-minWidths["IMAGE"])
+					columns[5].Width -= reduce
+					excess -= reduce
+					reduced = true
+				}
+				// Then reduce SIZE
 				if excess > 0 && columns[3].Width > minWidths["SIZE"] {
 					reduce := min(excess, columns[3].Width-minWidths["SIZE"])
 					columns[3].Width -= reduce
 					excess -= reduce
 					reduced = true
 				}
+				// Finally reduce IP if needed
+				if excess > 0 && columns[4].Width > minWidths["IP"] {
+					reduce := min(excess, columns[4].Width-minWidths["IP"])
+					columns[4].Width -= reduce
+					excess -= reduce
+					reduced = true
+				}
 				if !reduced {
-					break // Can't reduce further
+					break // Can't reduce further without breaking minimums
 				}
 			}
 		}
@@ -804,25 +960,85 @@ func min(a, b int) int {
 	return b
 }
 
+// Helper function to get public IP address from droplet
+func getPublicIP(d godo.Droplet) string {
+	for _, v4 := range d.Networks.V4 {
+		if v4.Type == "public" {
+			return v4.IPAddress
+		}
+	}
+	// Fallback to first IP if no public IP found
+	if len(d.Networks.V4) > 0 {
+		return d.Networks.V4[0].IPAddress
+	}
+	return ""
+}
+
+// Helper function to get private IP address from droplet
+func getPrivateIP(d godo.Droplet) string {
+	for _, v4 := range d.Networks.V4 {
+		if v4.Type == "private" {
+			return v4.IPAddress
+		}
+	}
+	return ""
+}
+
+// Helper function to get IP address based on type (public or private)
+func getIPByType(d godo.Droplet, ipType string) string {
+	if ipType == "private" {
+		return getPrivateIP(d)
+	}
+	return getPublicIP(d)
+}
+
 func (m *model) updateTableRows() {
 	var rows []table.Row
-	
-	if m.currentView == "cluster-resources" {
+
+	if m.currentView == viewClusterResources {
 		// Show cluster resources (deployments, pods, etc.)
 		m.updateClusterResourceTable()
 		return
-	} else if m.currentView == "clusters" {
-		// Update table columns for clusters
+	} else if m.currentView == viewClusters {
+		// Update table columns for clusters - make responsive
+		tableWidth := m.width - 2
+		if tableWidth < 50 {
+			tableWidth = 50
+		}
+		availableWidth := tableWidth - 6 // Account for borders
+
+		// Calculate responsive widths
+		nameWidth := max(int(float64(availableWidth)*0.30), 15)
+		statusWidth := max(int(float64(availableWidth)*0.15), 10)
+		regionWidth := max(int(float64(availableWidth)*0.12), 8)
+		versionWidth := max(int(float64(availableWidth)*0.15), 10)
+		nodePoolsWidth := max(int(float64(availableWidth)*0.12), 10)
+		nodesWidth := max(int(float64(availableWidth)*0.08), 6)
+		ageWidth := max(int(float64(availableWidth)*0.08), 6)
+
+		// Ensure total doesn't exceed available width
+		total := nameWidth + statusWidth + regionWidth + versionWidth + nodePoolsWidth + nodesWidth + ageWidth
+		if total > availableWidth {
+			scale := float64(availableWidth) / float64(total)
+			nameWidth = int(float64(nameWidth) * scale)
+			statusWidth = int(float64(statusWidth) * scale)
+			regionWidth = int(float64(regionWidth) * scale)
+			versionWidth = int(float64(versionWidth) * scale)
+			nodePoolsWidth = int(float64(nodePoolsWidth) * scale)
+			nodesWidth = int(float64(nodesWidth) * scale)
+			ageWidth = int(float64(ageWidth) * scale)
+		}
+
 		m.table.SetColumns([]table.Column{
-			{Title: "NAME", Width: 30},
-			{Title: "STATUS", Width: 12},
-			{Title: "REGION", Width: 10},
-			{Title: "VERSION", Width: 12},
-			{Title: "NODE POOLS", Width: 12},
-			{Title: "NODES", Width: 10},
-			{Title: "AGE", Width: 10},
+			{Title: "NAME", Width: nameWidth},
+			{Title: "STATUS", Width: statusWidth},
+			{Title: "REGION", Width: regionWidth},
+			{Title: "VERSION", Width: versionWidth},
+			{Title: "NODE POOLS", Width: nodePoolsWidth},
+			{Title: "NODES", Width: nodesWidth},
+			{Title: "AGE", Width: ageWidth},
 		})
-		
+
 		// Add cluster rows
 		for _, c := range m.clusters {
 			status := string(c.Status.State)
@@ -835,16 +1051,27 @@ func (m *model) updateTableRows() {
 				statusColor = warningColor
 				statusIcon = "◐"
 			}
+
+			// Truncate status text to fit column
+			statusText := strings.ToUpper(status)
+			maxStatusTextLen := statusWidth - 2 // Reserve 2 for icon+space
+			if maxStatusTextLen < 3 {
+				maxStatusTextLen = 3
+			}
+			if len(statusText) > maxStatusTextLen {
+				statusText = statusText[:maxStatusTextLen]
+			}
+
 			statusStyle := lipgloss.NewStyle().Foreground(statusColor).Bold(true)
-			statusDisplay := statusStyle.Render(fmt.Sprintf("%s %s", statusIcon, strings.ToUpper(status)))
-			
+			statusDisplay := statusStyle.Render(fmt.Sprintf("%s %s", statusIcon, statusText))
+
 			// Count node pools and nodes
 			nodePoolCount := len(c.NodePools)
 			totalNodes := 0
 			for _, np := range c.NodePools {
 				totalNodes += np.Count
 			}
-			
+
 			// Format age
 			age := "N/A"
 			if !c.CreatedAt.IsZero() {
@@ -855,29 +1082,82 @@ func (m *model) updateTableRows() {
 					age = fmt.Sprintf("%.0fd", duration.Hours()/24)
 				}
 			}
-			
+
+			// Truncate values to fit columns
+			clusterName := c.Name
+			if len(clusterName) > nameWidth {
+				if nameWidth <= 3 {
+					clusterName = "..."
+				} else {
+					clusterName = clusterName[:nameWidth-3] + "..."
+				}
+			}
+
+			regionSlug := c.RegionSlug
+			if len(regionSlug) > regionWidth {
+				if regionWidth <= 3 {
+					regionSlug = "..."
+				} else {
+					regionSlug = regionSlug[:regionWidth-3] + "..."
+				}
+			}
+
+			versionSlug := c.VersionSlug
+			if len(versionSlug) > versionWidth {
+				if versionWidth <= 3 {
+					versionSlug = "..."
+				} else {
+					versionSlug = versionSlug[:versionWidth-3] + "..."
+				}
+			}
+
 			rows = append(rows, table.Row{
-				c.Name,
+				clusterName,
 				statusDisplay,
-				c.RegionSlug,
-				c.VersionSlug,
+				regionSlug,
+				versionSlug,
 				fmt.Sprintf("%d", nodePoolCount),
 				fmt.Sprintf("%d", totalNodes),
 				age,
 			})
 		}
 	} else {
-		// Update table columns for droplets
+		// Update table columns for droplets - initial widths, will be adjusted by updateColumnWidths
+		// But ensure STATUS has minimum width to avoid truncation
 		m.table.SetColumns([]table.Column{
 			{Title: "NAME", Width: 25},
-			{Title: "STATUS", Width: 10},
+			{Title: "STATUS", Width: 12}, // Ensure minimum for status display
 			{Title: "REGION", Width: 10},
 			{Title: "SIZE", Width: 15},
 			{Title: "IP", Width: 16},
 			{Title: "IMAGE", Width: 20},
 			{Title: "AGE", Width: 10},
 		})
-		
+
+		// Get actual column widths for truncation
+		tableColumns := m.table.Columns()
+		nameColWidth := 25
+		ipColWidth := 13
+		imageColWidth := 20
+		statusColWidth := 12
+		sizeColWidth := 15
+
+		// Extract actual widths from table columns
+		for _, col := range tableColumns {
+			switch col.Title {
+			case "NAME":
+				nameColWidth = col.Width
+			case "IP":
+				ipColWidth = col.Width
+			case "IMAGE":
+				imageColWidth = col.Width
+			case "STATUS":
+				statusColWidth = col.Width
+			case "SIZE":
+				sizeColWidth = col.Width
+			}
+		}
+
 		// Add droplet rows
 		for _, d := range m.droplets {
 			if m.selectedRegion != "all" && d.Region.Slug != m.selectedRegion {
@@ -894,44 +1174,129 @@ func (m *model) updateTableRows() {
 				statusColor = warningColor
 				statusIcon = "◐"
 			}
-			statusStyle := lipgloss.NewStyle().Foreground(statusColor).Bold(true)
+			// Format status text - truncate if too long for column
 			statusText := strings.ToUpper(status)
+			// Limit status text to fit column (icon + space + text, reserve 2 chars for icon+space)
+			maxStatusTextLen := statusColWidth - 2
+			if maxStatusTextLen < 3 {
+				maxStatusTextLen = 3
+			}
+			if len(statusText) > maxStatusTextLen {
+				statusText = statusText[:maxStatusTextLen]
+			}
+			statusStyle := lipgloss.NewStyle().Foreground(statusColor).Bold(true)
 			statusDisplay := statusStyle.Render(fmt.Sprintf("%s %s", statusIcon, statusText))
 
+			// Always show public IP in table, with private IP if available
+			publicIP := getPublicIP(d)
+			privateIP := getPrivateIP(d)
+
 			ip := "No IP"
-			if len(d.Networks.V4) > 0 {
+			if publicIP != "" {
+				// Show public IP, and private IP if available (format: "public (private)")
+				// But truncate to fit column width - prefer showing public IP
+				if privateIP != "" {
+					// Check if both IPs fit in column (account for " ()" = 4 chars)
+					if len(publicIP)+len(privateIP)+4 <= ipColWidth {
+						ip = fmt.Sprintf("%s (%s)", publicIP, privateIP)
+					} else {
+						// Too long, just show public IP
+						ip = publicIP
+					}
+				} else {
+					ip = publicIP
+				}
+			} else if privateIP != "" {
+				// Only private IP available
+				ip = privateIP
+			} else if len(d.Networks.V4) > 0 {
+				// Fallback to first IP if no public/private detected
 				ip = d.Networks.V4[0].IPAddress
 			}
 
-			// Format size
+			// Truncate IP to fit column
+			if len(ip) > ipColWidth {
+				if ipColWidth <= 3 {
+					ip = "..."
+				} else {
+					ip = ip[:ipColWidth-3] + "..."
+				}
+			}
+
+			// Format size - extract vCPU and memory, truncate if needed
 			sizeDisplay := d.SizeSlug
 			if strings.Contains(d.SizeSlug, "-") {
 				parts := strings.Split(d.SizeSlug, "-")
 				if len(parts) >= 3 {
-					sizeDisplay = fmt.Sprintf("%s %s", parts[1], parts[2])
+					// Format as "2vCPU 4GB" for better readability
+					sizeDisplay = fmt.Sprintf("%svCPU %s", strings.ToUpper(parts[1]), strings.ToUpper(parts[2]))
+				}
+			}
+			// Truncate size if too long
+			if len(sizeDisplay) > sizeColWidth {
+				if sizeColWidth <= 3 {
+					sizeDisplay = "..."
+				} else {
+					sizeDisplay = sizeDisplay[:sizeColWidth-3] + "..."
 				}
 			}
 
-			// Format age
+			// Format age with better granularity (hours, days, months, years)
 			age := "N/A"
 			if d.Created != "" {
 				if t, err := time.Parse(time.RFC3339, d.Created); err == nil {
 					duration := time.Since(t)
-					if duration.Hours() < 24 {
-						age = fmt.Sprintf("%.0fh", duration.Hours())
-					} else {
-						age = fmt.Sprintf("%.0fd", duration.Hours()/24)
+					hours := duration.Hours()
+					switch {
+					case hours < 24:
+						age = fmt.Sprintf("%.0fh", hours)
+					case hours < 720: // Less than 30 days
+						days := hours / 24
+						age = fmt.Sprintf("%.0fd", days)
+					default:
+						// For older droplets, show months or years
+						days := hours / 24
+						if days >= 365 {
+							years := int(days / 365)
+							age = fmt.Sprintf("%dy", years)
+						} else {
+							months := int(days / 30)
+							if months > 0 {
+								age = fmt.Sprintf("%dmo", months)
+							} else {
+								age = fmt.Sprintf("%.0fd", days)
+							}
+						}
 					}
 				}
 			}
 
+			// Truncate long names and image names based on actual column widths
+			dropletName := d.Name
+			if len(dropletName) > nameColWidth {
+				if nameColWidth <= 3 {
+					dropletName = "..."
+				} else {
+					dropletName = dropletName[:nameColWidth-3] + "..."
+				}
+			}
+
+			imageName := d.Image.Name
+			if len(imageName) > imageColWidth {
+				if imageColWidth <= 3 {
+					imageName = "..."
+				} else {
+					imageName = imageName[:imageColWidth-3] + "..."
+				}
+			}
+
 			rows = append(rows, table.Row{
-				d.Name,
+				dropletName,
 				statusDisplay,
 				d.Region.Slug,
 				sizeDisplay,
 				ip,
-				d.Image.Name,
+				imageName,
 				age,
 			})
 		}
@@ -949,23 +1314,60 @@ func getMapValue(r map[string]interface{}, key string, defaultValue string) stri
 }
 
 func (m *model) updateClusterResourceTable() {
-	// Update table columns based on resource type
+	// Update table columns based on resource type - make them responsive
 	var columns []table.Column
 	var rows []table.Row
-	
+
+	// Calculate available width for table (account for borders)
+	tableWidth := m.width - 2
+	if tableWidth < 50 {
+		tableWidth = 50
+	}
+	availableWidth := tableWidth - 6 // Account for table borders
+
+	// Helper to truncate values based on column width
+	truncateValue := func(value string, maxWidth int) string {
+		if len(value) <= maxWidth {
+			return value
+		}
+		if maxWidth <= 3 {
+			return "..."
+		}
+		return value[:maxWidth-3] + "..."
+	}
+
 	switch m.clusterResourceType {
 	case "deployments":
+		// Calculate responsive widths
+		nameWidth := max(int(float64(availableWidth)*0.40), 15)
+		readyWidth := max(int(float64(availableWidth)*0.15), 8)
+		uptodateWidth := max(int(float64(availableWidth)*0.15), 10)
+		availableWidthCol := max(int(float64(availableWidth)*0.15), 10)
+		ageWidth := max(int(float64(availableWidth)*0.15), 6)
+
+		// Ensure total doesn't exceed available width
+		total := nameWidth + readyWidth + uptodateWidth + availableWidthCol + ageWidth
+		if total > availableWidth {
+			scale := float64(availableWidth) / float64(total)
+			nameWidth = int(float64(nameWidth) * scale)
+			readyWidth = int(float64(readyWidth) * scale)
+			uptodateWidth = int(float64(uptodateWidth) * scale)
+			availableWidthCol = int(float64(availableWidthCol) * scale)
+			ageWidth = int(float64(ageWidth) * scale)
+		}
+
 		columns = []table.Column{
-			{Title: "NAME", Width: 30},
-			{Title: "READY", Width: 10},
-			{Title: "UP-TO-DATE", Width: 12},
-			{Title: "AVAILABLE", Width: 12},
-			{Title: "AGE", Width: 10},
+			{Title: "NAME", Width: nameWidth},
+			{Title: "READY", Width: readyWidth},
+			{Title: "UP-TO-DATE", Width: uptodateWidth},
+			{Title: "AVAILABLE", Width: availableWidthCol},
+			{Title: "AGE", Width: ageWidth},
 		}
 		// Use actual resources from cluster
 		for _, r := range m.clusterResources {
+			name := truncateValue(getMapValue(r, "name", "N/A"), nameWidth)
 			rows = append(rows, table.Row{
-				getMapValue(r, "name", "N/A"),
+				name,
 				getMapValue(r, "ready", "0/0"),
 				getMapValue(r, "upToDate", "0"),
 				getMapValue(r, "available", "0"),
@@ -973,89 +1375,160 @@ func (m *model) updateClusterResourceTable() {
 			})
 		}
 	case "pods":
+		nameWidth := max(int(float64(availableWidth)*0.45), 15)
+		readyWidth := max(int(float64(availableWidth)*0.15), 8)
+		statusWidth := max(int(float64(availableWidth)*0.15), 10)
+		restartsWidth := max(int(float64(availableWidth)*0.10), 8)
+		ageWidth := max(int(float64(availableWidth)*0.15), 6)
+
+		total := nameWidth + readyWidth + statusWidth + restartsWidth + ageWidth
+		if total > availableWidth {
+			scale := float64(availableWidth) / float64(total)
+			nameWidth = int(float64(nameWidth) * scale)
+			readyWidth = int(float64(readyWidth) * scale)
+			statusWidth = int(float64(statusWidth) * scale)
+			restartsWidth = int(float64(restartsWidth) * scale)
+			ageWidth = int(float64(ageWidth) * scale)
+		}
+
 		columns = []table.Column{
-			{Title: "NAME", Width: 35},
-			{Title: "READY", Width: 10},
-			{Title: "STATUS", Width: 12},
-			{Title: "RESTARTS", Width: 10},
-			{Title: "AGE", Width: 10},
+			{Title: "NAME", Width: nameWidth},
+			{Title: "READY", Width: readyWidth},
+			{Title: "STATUS", Width: statusWidth},
+			{Title: "RESTARTS", Width: restartsWidth},
+			{Title: "AGE", Width: ageWidth},
 		}
 		for _, r := range m.clusterResources {
+			name := truncateValue(getMapValue(r, "name", "N/A"), nameWidth)
 			rows = append(rows, table.Row{
-				getMapValue(r, "name", "N/A"),
+				name,
 				getMapValue(r, "ready", "0/0"),
-				getMapValue(r, "status", "Unknown"),
+				truncateValue(getMapValue(r, "status", "Unknown"), statusWidth),
 				getMapValue(r, "restarts", "0"),
 				getMapValue(r, "age", "N/A"),
 			})
 		}
 	case "services":
+		nameWidth := max(int(float64(availableWidth)*0.35), 15)
+		typeWidth := max(int(float64(availableWidth)*0.15), 10)
+		clusterIPWidth := max(int(float64(availableWidth)*0.20), 12)
+		externalIPWidth := max(int(float64(availableWidth)*0.20), 12)
+		ageWidth := max(int(float64(availableWidth)*0.10), 6)
+
+		total := nameWidth + typeWidth + clusterIPWidth + externalIPWidth + ageWidth
+		if total > availableWidth {
+			scale := float64(availableWidth) / float64(total)
+			nameWidth = int(float64(nameWidth) * scale)
+			typeWidth = int(float64(typeWidth) * scale)
+			clusterIPWidth = int(float64(clusterIPWidth) * scale)
+			externalIPWidth = int(float64(externalIPWidth) * scale)
+			ageWidth = int(float64(ageWidth) * scale)
+		}
+
 		columns = []table.Column{
-			{Title: "NAME", Width: 30},
-			{Title: "TYPE", Width: 12},
-			{Title: "CLUSTER-IP", Width: 15},
-			{Title: "EXTERNAL-IP", Width: 15},
-			{Title: "AGE", Width: 10},
+			{Title: "NAME", Width: nameWidth},
+			{Title: "TYPE", Width: typeWidth},
+			{Title: "CLUSTER-IP", Width: clusterIPWidth},
+			{Title: "EXTERNAL-IP", Width: externalIPWidth},
+			{Title: "AGE", Width: ageWidth},
 		}
 		for _, r := range m.clusterResources {
+			name := truncateValue(getMapValue(r, "name", "N/A"), nameWidth)
+			clusterIP := truncateValue(getMapValue(r, "clusterIP", "<none>"), clusterIPWidth)
+			externalIP := truncateValue(getMapValue(r, "externalIP", "<none>"), externalIPWidth)
 			rows = append(rows, table.Row{
-				getMapValue(r, "name", "N/A"),
-				getMapValue(r, "type", "ClusterIP"),
-				getMapValue(r, "clusterIP", "<none>"),
-				getMapValue(r, "externalIP", "<none>"),
+				name,
+				truncateValue(getMapValue(r, "type", "ClusterIP"), typeWidth),
+				clusterIP,
+				externalIP,
 				getMapValue(r, "age", "N/A"),
 			})
 		}
 	case "nodes":
+		nameWidth := max(int(float64(availableWidth)*0.40), 15)
+		statusWidth := max(int(float64(availableWidth)*0.20), 10)
+		rolesWidth := max(int(float64(availableWidth)*0.15), 8)
+		ageWidth := max(int(float64(availableWidth)*0.10), 6)
+		versionWidth := max(int(float64(availableWidth)*0.15), 10)
+
+		total := nameWidth + statusWidth + rolesWidth + ageWidth + versionWidth
+		if total > availableWidth {
+			scale := float64(availableWidth) / float64(total)
+			nameWidth = int(float64(nameWidth) * scale)
+			statusWidth = int(float64(statusWidth) * scale)
+			rolesWidth = int(float64(rolesWidth) * scale)
+			ageWidth = int(float64(ageWidth) * scale)
+			versionWidth = int(float64(versionWidth) * scale)
+		}
+
 		columns = []table.Column{
-			{Title: "NAME", Width: 30},
-			{Title: "STATUS", Width: 12},
-			{Title: "ROLES", Width: 10},
-			{Title: "AGE", Width: 10},
-			{Title: "VERSION", Width: 12},
+			{Title: "NAME", Width: nameWidth},
+			{Title: "STATUS", Width: statusWidth},
+			{Title: "ROLES", Width: rolesWidth},
+			{Title: "AGE", Width: ageWidth},
+			{Title: "VERSION", Width: versionWidth},
 		}
 		for _, r := range m.clusterResources {
+			name := truncateValue(getMapValue(r, "name", "N/A"), nameWidth)
+			version := truncateValue(getMapValue(r, "version", "N/A"), versionWidth)
 			rows = append(rows, table.Row{
-				getMapValue(r, "name", "N/A"),
-				getMapValue(r, "status", "Unknown"),
-				getMapValue(r, "roles", "<none>"),
+				name,
+				truncateValue(getMapValue(r, "status", "Unknown"), statusWidth),
+				truncateValue(getMapValue(r, "roles", "<none>"), rolesWidth),
 				getMapValue(r, "age", "N/A"),
-				getMapValue(r, "version", "N/A"),
+				version,
 			})
 		}
 	case "namespaces":
+		nameWidth := max(int(float64(availableWidth)*0.60), 20)
+		statusWidth := max(int(float64(availableWidth)*0.20), 10)
+		ageWidth := max(int(float64(availableWidth)*0.20), 8)
+
+		total := nameWidth + statusWidth + ageWidth
+		if total > availableWidth {
+			scale := float64(availableWidth) / float64(total)
+			nameWidth = int(float64(nameWidth) * scale)
+			statusWidth = int(float64(statusWidth) * scale)
+			ageWidth = int(float64(ageWidth) * scale)
+		}
+
 		columns = []table.Column{
-			{Title: "NAME", Width: 30},
-			{Title: "STATUS", Width: 12},
-			{Title: "AGE", Width: 10},
+			{Title: "NAME", Width: nameWidth},
+			{Title: "STATUS", Width: statusWidth},
+			{Title: "AGE", Width: ageWidth},
 		}
 		// Add "all" option at the top for selecting all namespaces
 		rows = append(rows, table.Row{"all", "Active", "N/A"})
 		for _, r := range m.clusterResources {
+			name := truncateValue(getMapValue(r, "name", "N/A"), nameWidth)
 			rows = append(rows, table.Row{
-				getMapValue(r, "name", "N/A"),
-				getMapValue(r, "status", "Unknown"),
+				name,
+				truncateValue(getMapValue(r, "status", "Unknown"), statusWidth),
 				getMapValue(r, "age", "N/A"),
 			})
 		}
 	default:
+		nameWidth := max(int(float64(availableWidth)*0.60), 20)
+		statusWidth := max(int(float64(availableWidth)*0.20), 10)
+		ageWidth := max(int(float64(availableWidth)*0.20), 8)
+
 		columns = []table.Column{
-			{Title: "NAME", Width: 30},
-			{Title: "STATUS", Width: 12},
-			{Title: "AGE", Width: 10},
+			{Title: "NAME", Width: nameWidth},
+			{Title: "STATUS", Width: statusWidth},
+			{Title: "AGE", Width: ageWidth},
 		}
 		rows = []table.Row{
 			{"No resources", "N/A", "N/A"},
 		}
 	}
-	
+
 	// CRITICAL: Clear rows FIRST before setting columns
 	// This prevents the table library from trying to render old rows with new column structure
 	m.table.SetRows([]table.Row{})
-	
+
 	// Set columns
 	m.table.SetColumns(columns)
-	
+
 	// Ensure we have at least one row to prevent rendering issues
 	if len(rows) == 0 {
 		// Create a placeholder row matching the column count
@@ -1065,9 +1538,54 @@ func (m *model) updateClusterResourceTable() {
 		}
 		rows = []table.Row{placeholderRow}
 	}
-	
+
 	// Now set the rows with the correct column structure
 	m.table.SetRows(rows)
+}
+
+func (m model) updateSSHIPSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "1", "p", "P":
+		// Select public IP
+		if m.selectedDroplet != nil {
+			publicIP := getPublicIP(*m.selectedDroplet)
+			if publicIP != "" {
+				m.sshIPType = "public"
+				sshIP = publicIP
+				sshName = m.selectedDroplet.Name
+				m.selectingSSHIP = false
+				m.selectedDroplet = nil
+				return m, tea.Sequence(
+					tea.ExitAltScreen,
+					tea.Quit,
+				)
+			}
+		}
+		return m, nil
+	case "2", "r", "R":
+		// Select private IP
+		if m.selectedDroplet != nil {
+			privateIP := getPrivateIP(*m.selectedDroplet)
+			if privateIP != "" {
+				m.sshIPType = "private"
+				sshIP = privateIP
+				sshName = m.selectedDroplet.Name
+				m.selectingSSHIP = false
+				m.selectedDroplet = nil
+				return m, tea.Sequence(
+					tea.ExitAltScreen,
+					tea.Quit,
+				)
+			}
+		}
+		return m, nil
+	case "esc", "q", "Q":
+		// Cancel SSH selection
+		m.selectingSSHIP = false
+		m.selectedDroplet = nil
+		return m, nil
+	}
+	return m, nil
 }
 
 func (m model) updateDeleteConfirmation(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1086,6 +1604,11 @@ func (m model) updateDeleteConfirmation(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) updateCreateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
+	// Handle selection mode (when selecting region, size, or image)
+	if m.selectingRegion || m.selectingSize || m.selectingImage {
+		return m.updateSelectionMode(msg)
+	}
+
 	switch msg.String() {
 	case "esc":
 		m.creating = false
@@ -1093,7 +1616,7 @@ func (m model) updateCreateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		return m, nil
 	case "tab":
-		m.inputIndex = (m.inputIndex + 1) % 5
+		m.inputIndex = (m.inputIndex + 1) % 5 // 5 fields: name(0), region(1), size(2), image(3), tags(4)
 		m.updateInputFocus()
 		return m, nil
 	case "shift+tab":
@@ -1101,24 +1624,38 @@ func (m model) updateCreateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.updateInputFocus()
 		return m, nil
 	case "enter":
-		if m.inputIndex == 4 {
-			m.loading = true
-			return m, tea.Batch(createDroplet(m.client, m), m.spinner.Tick)
+		// Open selection for region/size/image, or create droplet if on tags field
+		if m.inputIndex == 1 {
+			// Region field - open region selection
+			m.selectingRegion = true
+			m.setupSelectionTable("region")
+			return m, nil
+		} else if m.inputIndex == 2 {
+			// Size field - open size selection
+			m.selectingSize = true
+			m.setupSelectionTable("size")
+			return m, nil
+		} else if m.inputIndex == 3 {
+			// Image field - open image selection
+			m.selectingImage = true
+			m.setupSelectionTable("image")
+			return m, nil
+		} else if m.inputIndex == 4 {
+			// Tags field - create droplet
+			if m.selectedRegionSlug != "" && m.selectedSizeSlug != "" && m.selectedImageSlug != "" {
+				m.loading = true
+				return m, tea.Batch(createDroplet(m.client, m), m.spinner.Tick)
+			} else {
+				m.err = fmt.Errorf("please select region, size, and image")
+				return m, nil
+			}
 		}
-		m.inputIndex = (m.inputIndex + 1) % 5
-		m.updateInputFocus()
 		return m, nil
 	}
 
 	switch m.inputIndex {
 	case 0:
 		m.nameInput, cmd = m.nameInput.Update(msg)
-	case 1:
-		m.regionInput, cmd = m.regionInput.Update(msg)
-	case 2:
-		m.sizeInput, cmd = m.sizeInput.Update(msg)
-	case 3:
-		m.imageInput, cmd = m.imageInput.Update(msg)
 	case 4:
 		m.tagsInput, cmd = m.tagsInput.Update(msg)
 	}
@@ -1126,22 +1663,179 @@ func (m model) updateCreateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) updateSelectionMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg.String() {
+	case "esc":
+		// Cancel selection
+		m.selectingRegion = false
+		m.selectingSize = false
+		m.selectingImage = false
+		return m, nil
+	case "enter":
+		// Confirm selection
+		if m.selectionTable.SelectedRow() != nil && len(m.selectionTable.SelectedRow()) > 0 {
+			selectedSlug := m.selectionTable.SelectedRow()[0]
+			if m.selectingRegion {
+				m.selectedRegionSlug = selectedSlug
+				m.selectingRegion = false
+				m.inputIndex = 2 // Move to size field
+			} else if m.selectingSize {
+				m.selectedSizeSlug = selectedSlug
+				m.selectingSize = false
+				m.inputIndex = 3 // Move to image field
+			} else if m.selectingImage {
+				m.selectedImageSlug = selectedSlug
+				m.selectingImage = false
+				m.inputIndex = 4 // Move to tags field
+			}
+		}
+		return m, nil
+	}
+
+	// Handle table navigation
+	m.selectionTable, cmd = m.selectionTable.Update(msg)
+	return m, cmd
+}
+
+func (m *model) setupSelectionTable(selectionType string) {
+	var columns []table.Column
+	var rows []table.Row
+
+	switch selectionType {
+	case "region":
+		columns = []table.Column{
+			{Title: "SLUG", Width: 15},
+			{Title: "NAME", Width: 30},
+			{Title: "AVAILABLE", Width: 12},
+		}
+		for _, r := range m.availableRegions {
+			available := "Yes"
+			if !r.Available {
+				available = "No"
+			}
+			rows = append(rows, table.Row{
+				r.Slug,
+				r.Name,
+				available,
+			})
+		}
+	case "size":
+		columns = []table.Column{
+			{Title: "SLUG", Width: 20},
+			{Title: "VCPU", Width: 8},
+			{Title: "RAM", Width: 12},
+			{Title: "DISK", Width: 12},
+			{Title: "PRICE", Width: 12},
+		}
+		for _, s := range m.availableSizes {
+			ramGB := float64(s.Memory) / 1024.0
+			price := "$0.00"
+			if s.PriceMonthly > 0 {
+				price = fmt.Sprintf("$%.2f", s.PriceMonthly)
+			}
+			rows = append(rows, table.Row{
+				s.Slug,
+				fmt.Sprintf("%d", s.Vcpus),
+				fmt.Sprintf("%.0fGB", ramGB),
+				fmt.Sprintf("%dGB", s.Disk),
+				price,
+			})
+		}
+	case "image":
+		columns = []table.Column{
+			{Title: "DISTRIBUTION", Width: 20},
+			{Title: "ARCHITECTURE", Width: 15},
+			{Title: "SLUG", Width: 35},
+		}
+		for _, img := range m.availableImages {
+			// Determine architecture from slug
+			slugLower := strings.ToLower(img.Slug)
+			architecture := "x64"
+			if strings.Contains(slugLower, "-x86") || strings.Contains(slugLower, "_x86") {
+				architecture = "x86"
+			} else if strings.Contains(slugLower, "-x64") || strings.Contains(slugLower, "_x64") ||
+				strings.Contains(slugLower, "-amd64") || strings.Contains(slugLower, "_amd64") {
+				architecture = "x64"
+			} else {
+				// Fallback: check name
+				nameLower := strings.ToLower(img.Name)
+				if strings.Contains(nameLower, "x86") {
+					architecture = "x86"
+				} else {
+					architecture = "x64" // Default to x64
+				}
+			}
+
+			// Get distribution
+			distribution := img.Distribution
+			if distribution == "" {
+				// Try to extract from slug (e.g., "ubuntu-22-04-x64" -> "Ubuntu", "debian-12-x64" -> "Debian")
+				slugParts := strings.Split(img.Slug, "-")
+				if len(slugParts) > 0 {
+					distName := slugParts[0]
+					// Capitalize properly (debian -> Debian, ubuntu -> Ubuntu)
+					if len(distName) > 0 {
+						distribution = strings.ToUpper(distName[:1]) + strings.ToLower(distName[1:])
+					} else {
+						distribution = "Unknown"
+					}
+				} else {
+					distribution = "Unknown"
+				}
+			} else {
+				// Ensure proper capitalization (e.g., "Debian", "Ubuntu")
+				distLower := strings.ToLower(distribution)
+				if len(distLower) > 0 {
+					distribution = strings.ToUpper(distLower[:1]) + distLower[1:]
+				}
+			}
+
+			// Truncate slug if needed
+			slug := img.Slug
+			if len(slug) > 33 {
+				slug = slug[:30] + "..."
+			}
+
+			rows = append(rows, table.Row{
+				distribution,
+				architecture,
+				slug,
+			})
+		}
+	}
+
+	// CRITICAL: Clear rows FIRST before setting columns
+	// This prevents the table library from trying to render old rows with new column structure
+	m.selectionTable.SetRows([]table.Row{})
+
+	// Set columns
+	m.selectionTable.SetColumns(columns)
+
+	// Ensure we have at least one row to prevent rendering issues
+	if len(rows) == 0 {
+		// Create a placeholder row matching the column count
+		placeholderRow := make(table.Row, len(columns))
+		for i := range placeholderRow {
+			placeholderRow[i] = "No data"
+		}
+		rows = []table.Row{placeholderRow}
+	}
+
+	// Now set the rows with the correct column structure
+	m.selectionTable.SetRows(rows)
+	m.selectionTable.SetHeight(10)
+	m.selectionTable.SetWidth(m.width - 4)
+}
+
 func (m *model) updateInputFocus() {
 	m.nameInput.Blur()
-	m.regionInput.Blur()
-	m.sizeInput.Blur()
-	m.imageInput.Blur()
 	m.tagsInput.Blur()
 
 	switch m.inputIndex {
 	case 0:
 		m.nameInput.Focus()
-	case 1:
-		m.regionInput.Focus()
-	case 2:
-		m.sizeInput.Focus()
-	case 3:
-		m.imageInput.Focus()
 	case 4:
 		m.tagsInput.Focus()
 	}
@@ -1149,11 +1843,14 @@ func (m *model) updateInputFocus() {
 
 func (m *model) resetInputs() {
 	m.nameInput.SetValue("")
-	m.regionInput.SetValue("")
-	m.sizeInput.SetValue("")
-	m.imageInput.SetValue("")
 	m.tagsInput.SetValue("")
 	m.inputIndex = 0
+	m.selectedRegionSlug = ""
+	m.selectedSizeSlug = ""
+	m.selectedImageSlug = ""
+	m.selectingRegion = false
+	m.selectingSize = false
+	m.selectingImage = false
 }
 
 func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1171,35 +1868,35 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.commandMode = false
 		m.commandInput.Blur()
 		m.commandInput.SetValue("")
-		
+
 		if command == "" {
 			return m, nil
 		}
-		
+
 		// Handle resource type switching
 		validResources := map[string]bool{
-			"deployments": true,
-			"pods":        true,
-			"services":    true,
-			"daemonsets":  true,
+			"deployments":  true,
+			"pods":         true,
+			"services":     true,
+			"daemonsets":   true,
 			"statefulsets": true,
-			"pvc":         true,
-			"configmaps":  true,
-			"secrets":     true,
-			"nodes":       true,
-			"namespaces":  true,
+			"pvc":          true,
+			"configmaps":   true,
+			"secrets":      true,
+			"nodes":        true,
+			"namespaces":   true,
 		}
-		
+
 		// Convert to lowercase for case-insensitive matching
 		commandLower := strings.ToLower(command)
-		
+
 		if validResources[commandLower] {
 			m.clusterResourceType = commandLower
 			m.loading = true
 			m.updateTableRows()
 			return m, tea.Batch(loadClusterResources(m.client, m.selectedCluster, m.clusterResourceType, m.selectedNamespace), m.spinner.Tick)
 		}
-		
+
 		// If command not recognized, show error (could be enhanced)
 		return m, nil
 	}
@@ -1210,43 +1907,53 @@ func (m model) updateCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) renderCommandMode() string {
 	var s strings.Builder
-	
+
 	// Show main view in background
 	mainView := m.renderMainView()
 	s.WriteString(mainView)
-	
+
 	// Overlay command input at bottom
 	commandText := m.commandInput.View()
 	commandPrompt := lipgloss.NewStyle().
 		Foreground(warningColor).
 		Bold(true).
 		Render(":")
-	
+
 	commandLine := lipgloss.NewStyle().
 		Background(bgColor).
 		Foreground(lipgloss.Color("255")).
 		Padding(0, 1).
 		Width(m.width).
 		Render(commandPrompt + " " + commandText)
-	
+
 	s.WriteString("\n")
 	s.WriteString(commandLine)
-	
-	// Show available resources
+
+	// Show available resources - truncate if too long
 	availableResources := []string{"deployments", "pods", "services", "daemonsets", "statefulsets", "pvc", "configmaps", "secrets", "nodes", "namespaces"}
-	helpText := lipgloss.NewStyle().
+	helpText := fmt.Sprintf("Available: %s", strings.Join(availableResources, ", "))
+	maxHelpLen := m.width - 4
+	if len(helpText) > maxHelpLen {
+		// Truncate help text to fit
+		helpText = helpText[:maxHelpLen-3] + "..."
+	}
+	helpTextStyled := lipgloss.NewStyle().
 		Foreground(mutedColor).
-		Render(fmt.Sprintf("Available: %s", strings.Join(availableResources, ", ")))
-	
+		Render(helpText)
+
 	s.WriteString("\n")
-	s.WriteString(helpText)
-	
+	s.WriteString(helpTextStyled)
+
 	return s.String()
 }
 
 func (m model) View() string {
 	if m.commandMode {
 		return m.renderCommandMode()
+	}
+
+	if m.selectingSSHIP {
+		return m.renderSSHIPSelection()
 	}
 
 	if m.confirmDelete {
@@ -1261,7 +1968,7 @@ func (m model) View() string {
 		if m.selectedDroplet != nil {
 			return m.renderDropletDetails()
 		}
-		if m.selectedCluster != nil && m.currentView != "cluster-resources" {
+		if m.selectedCluster != nil && m.currentView != viewClusterResources {
 			return m.renderClusterDetails()
 		}
 	}
@@ -1420,7 +2127,7 @@ func (m model) renderTopBarTwoPanel() string {
 	accountInfo.WriteString("\n")
 
 	// Always show essential summary info - prioritize visibility
-	if m.currentView == "cluster-resources" && m.selectedCluster != nil {
+	if m.currentView == viewClusterResources && m.selectedCluster != nil {
 		accountInfo.WriteString(labelStyle.Render("Cluster: ") + valueStyle.Render(m.selectedCluster.Name))
 		accountInfo.WriteString("\n")
 		accountInfo.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedCluster.RegionSlug))
@@ -1434,15 +2141,23 @@ func (m model) renderTopBarTwoPanel() string {
 		accountInfo.WriteString(labelStyle.Render("Resource: ") + valueStyle.Render(strings.Title(m.clusterResourceType)))
 		accountInfo.WriteString("\n")
 		accountInfo.WriteString(labelStyle.Render("Count: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.clusterResources))))
-	} else if m.currentView == "clusters" {
+	} else if m.currentView == viewClusters {
 		accountInfo.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Kubernetes Clusters"))
 		accountInfo.WriteString("\n")
 		accountInfo.WriteString(labelStyle.Render("Clusters: ") + valueStyle.Render(fmt.Sprintf("%d", m.clusterCount)))
 	} else {
 		accountInfo.WriteString(labelStyle.Render("Droplets: ") + valueStyle.Render(fmt.Sprintf("%d", m.dropletCount)))
 		accountInfo.WriteString("\n")
-		// Don't truncate region - show full region name
-		accountInfo.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedRegion))
+		// Truncate region if too long to fit panel
+		region := m.selectedRegion
+		maxRegionLen := panelWidth - 9 // Reserve space for "Region: " label
+		if maxRegionLen < 5 {
+			maxRegionLen = 5
+		}
+		if len(region) > maxRegionLen {
+			region = truncateString(region, maxRegionLen)
+		}
+		accountInfo.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(region))
 		accountInfo.WriteString("\n")
 	}
 
@@ -1524,7 +2239,7 @@ func (m model) renderTopBarK9sStyle() string {
 	if availableWidth < 100 {
 		availableWidth = 100
 	}
-	
+
 	// Left panel: Account/Context info (like k9s Context/Cluster/User)
 	// Give left panel more space to ensure all info is visible (minimum 50 chars)
 	leftWidth := availableWidth / 3
@@ -1541,13 +2256,13 @@ func (m model) renderTopBarK9sStyle() string {
 	if rightWidth < 30 {
 		rightWidth = 30
 		// Recalculate if we hit minimums - prioritize middle panel for keybindings
-		if leftWidth + middleWidth + rightWidth > availableWidth {
+		if leftWidth+middleWidth+rightWidth > availableWidth {
 			// Reduce left panel if needed, but keep middle panel at minimum
 			leftWidth = availableWidth - middleWidth - rightWidth
 			if leftWidth < 40 {
 				leftWidth = 40
 				// If still too wide, reduce right panel
-				if leftWidth + middleWidth + rightWidth > availableWidth {
+				if leftWidth+middleWidth+rightWidth > availableWidth {
 					rightWidth = availableWidth - leftWidth - middleWidth
 					if rightWidth < 20 {
 						rightWidth = 20
@@ -1561,64 +2276,85 @@ func (m model) renderTopBarK9sStyle() string {
 	var leftContent strings.Builder
 	leftContent.WriteString(labelStyle.Render("Context: ") + valueStyle.Render("DigitalOcean"))
 	leftContent.WriteString("\n")
-	
-	if m.currentView == "cluster-resources" {
+
+	if m.currentView == viewClusterResources {
 		// Show cluster info when viewing cluster resources
 		if m.selectedCluster != nil {
-			leftContent.WriteString(labelStyle.Render("Cluster: ") + valueStyle.Render(m.selectedCluster.Name))
+			// Truncate cluster name
+			clusterName := truncateString(m.selectedCluster.Name, leftWidth-10)
+			leftContent.WriteString(labelStyle.Render("Cluster: ") + valueStyle.Render(clusterName))
 			leftContent.WriteString("\n")
-			leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedCluster.RegionSlug))
+			// Truncate region
+			region := truncateString(m.selectedCluster.RegionSlug, leftWidth-10)
+			leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(region))
 			leftContent.WriteString("\n")
-			leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render(m.selectedCluster.VersionSlug))
+			// Truncate version
+			version := truncateString(m.selectedCluster.VersionSlug, leftWidth-11)
+			leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render(version))
 			leftContent.WriteString("\n")
-			
+
 			// Show namespace filter
 			namespaceDisplay := "all"
 			if m.selectedNamespace != "" {
-				namespaceDisplay = m.selectedNamespace
+				namespaceDisplay = truncateString(m.selectedNamespace, leftWidth-13)
 			}
 			leftContent.WriteString(labelStyle.Render("Namespace: ") + valueStyle.Render(namespaceDisplay))
 			leftContent.WriteString("\n")
-			
+
 			// Show resource type
-			leftContent.WriteString(labelStyle.Render("Resource: ") + valueStyle.Render(strings.Title(m.clusterResourceType)))
+			resourceType := truncateString(strings.Title(m.clusterResourceType), leftWidth-11)
+			leftContent.WriteString(labelStyle.Render("Resource: ") + valueStyle.Render(resourceType))
 			leftContent.WriteString("\n")
-			
+
 			// Show resource count
 			leftContent.WriteString(labelStyle.Render("Count: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.clusterResources))))
 			leftContent.WriteString("\n")
 		}
-	} else if m.currentView == "clusters" {
+	} else if m.currentView == viewClusters {
 		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Kubernetes Clusters"))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Clusters: ") + valueStyle.Render(fmt.Sprintf("%d", m.clusterCount)))
 	} else {
-		leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedRegion))
+		// Truncate region if needed
+		region := truncateString(m.selectedRegion, leftWidth-9)
+		leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(region))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Droplets: ") + valueStyle.Render(fmt.Sprintf("%d", m.dropletCount)))
 	}
 	leftContent.WriteString("\n")
-	
-	if m.account != nil && m.currentView != "cluster-resources" {
-		// Don't truncate email - show full email or use shorter label
+
+	if m.account != nil && m.currentView != viewClusterResources {
+		// Truncate email to fit panel width
 		email := m.account.Email
-		if len(email) > leftWidth-10 {
-			// If email is too long, show first part
-			email = email[:min(len(email), leftWidth-10)] + "..."
+		maxEmailLen := leftWidth - 10 // Reserve space for "Account: " label
+		if maxEmailLen < 5 {
+			maxEmailLen = 5
+		}
+		if len(email) > maxEmailLen {
+			email = truncateString(email, maxEmailLen)
 		}
 		leftContent.WriteString(labelStyle.Render("Account: ") + valueStyle.Render(email))
 		leftContent.WriteString("\n")
-		leftContent.WriteString(labelStyle.Render("Status: ") + valueStyle.Render(m.account.Status))
+		// Truncate status if needed
+		status := m.account.Status
+		maxStatusLen := leftWidth - 9 // Reserve space for "Status: " label
+		if maxStatusLen < 5 {
+			maxStatusLen = 5
+		}
+		if len(status) > maxStatusLen {
+			status = truncateString(status, maxStatusLen)
+		}
+		leftContent.WriteString(labelStyle.Render("Status: ") + valueStyle.Render(status))
 		leftContent.WriteString("\n")
 	}
-	
+
 	refreshTime := "N/A"
 	if !m.lastRefresh.IsZero() {
 		refreshTime = m.lastRefresh.Format("15:04:05")
 	}
 	leftContent.WriteString(labelStyle.Render("Refresh: ") + valueStyle.Render(refreshTime))
 	leftContent.WriteString("\n")
-		leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.1.0"))
+	leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.2.0"))
 
 	// iTerm-optimized: Better padding for left panel
 	leftPanel := lipgloss.NewStyle().
@@ -1631,10 +2367,10 @@ func (m model) renderTopBarK9sStyle() string {
 	var middleContent strings.Builder
 	middleContent.WriteString(headerStyle.Render("Keys"))
 	middleContent.WriteString("\n")
-	
+
 	// iTerm-optimized: Simple format matching the desired output
 	// CRITICAL: Always show 1, 2, n first - simple format like "1 Droplets"
-	if m.currentView == "cluster-resources" {
+	if m.currentView == viewClusterResources {
 		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
 		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
 		middleContent.WriteString(keyStyle.Render(":") + " Command\n")
@@ -1644,7 +2380,7 @@ func (m model) renderTopBarK9sStyle() string {
 		middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
 		middleContent.WriteString(keyStyle.Render("esc") + " Back\n")
 		middleContent.WriteString(keyStyle.Render("q") + " Quit")
-	} else if m.currentView == "droplets" {
+	} else if m.currentView == viewDroplets {
 		// Droplets view - show 1, 2, n prominently (matching image format)
 		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
 		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
@@ -1682,7 +2418,7 @@ func (m model) renderTopBarK9sStyle() string {
 			rightContent.WriteString("\n")
 		}
 	}
-	
+
 	// Add DOGOCTL ASCII art if space allows
 	if m.width > 140 {
 		rightContent.WriteString("\n\n")
@@ -1738,8 +2474,8 @@ func (m model) renderTopBarTwoPanelK9s() string {
 	var leftContent strings.Builder
 	leftContent.WriteString(labelStyle.Render("Context: ") + valueStyle.Render("DigitalOcean"))
 	leftContent.WriteString("\n")
-	
-	if m.currentView == "cluster-resources" && m.selectedCluster != nil {
+
+	if m.currentView == viewClusterResources && m.selectedCluster != nil {
 		leftContent.WriteString(labelStyle.Render("Cluster: ") + valueStyle.Render(m.selectedCluster.Name))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedCluster.RegionSlug))
@@ -1753,7 +2489,7 @@ func (m model) renderTopBarTwoPanelK9s() string {
 		leftContent.WriteString(labelStyle.Render("Resource: ") + valueStyle.Render(strings.Title(m.clusterResourceType)))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Count: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.clusterResources))))
-	} else if m.currentView == "clusters" {
+	} else if m.currentView == viewClusters {
 		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Kubernetes Clusters"))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Clusters: ") + valueStyle.Render(fmt.Sprintf("%d", m.clusterCount)))
@@ -1762,15 +2498,15 @@ func (m model) renderTopBarTwoPanelK9s() string {
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Droplets: ") + valueStyle.Render(fmt.Sprintf("%d", m.dropletCount)))
 	}
-	
+
 	refreshTime := "N/A"
 	if !m.lastRefresh.IsZero() {
 		refreshTime = m.lastRefresh.Format("15:04:05")
 	}
 	leftContent.WriteString("\n")
 	leftContent.WriteString(labelStyle.Render("Refresh: ") + valueStyle.Render(refreshTime))
-	
-	if m.account != nil && m.currentView != "cluster-resources" {
+
+	if m.account != nil && m.currentView != viewClusterResources {
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Status: ") + valueStyle.Render(m.account.Status))
 	}
@@ -1786,7 +2522,7 @@ func (m model) renderTopBarTwoPanelK9s() string {
 	var rightContent strings.Builder
 	rightContent.WriteString(headerStyle.Render("Keys"))
 	rightContent.WriteString("\n")
-	
+
 	// iTerm-optimized: Simple format matching the desired output
 	// CRITICAL: Always show 1, 2, n first - simple format like "1 Droplets"
 	if m.currentView == "droplets" {
@@ -1800,7 +2536,7 @@ func (m model) renderTopBarTwoPanelK9s() string {
 		rightContent.WriteString(keyStyle.Render("enter") + " Details\n")
 		rightContent.WriteString(keyStyle.Render("?") + " Help\n")
 		rightContent.WriteString(keyStyle.Render("q") + " Quit")
-	} else if m.currentView == "clusters" {
+	} else if m.currentView == viewClusters {
 		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
 		rightContent.WriteString(keyStyle.Render("2") + " Clusters\n")
 		rightContent.WriteString(keyStyle.Render("r") + " Refresh\n")
@@ -1822,7 +2558,7 @@ func (m model) renderTopBarTwoPanelK9s() string {
 	if rightPanelWidth < minWidth {
 		rightPanelWidth = minWidth
 	}
-	
+
 	// iTerm-friendly padding and rendering
 	rightPanel := lipgloss.NewStyle().
 		Width(rightPanelWidth).
@@ -1844,7 +2580,7 @@ func (m model) renderTopBarCompactK9s() string {
 	var keybindings string
 	if m.currentView == "droplets" {
 		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<n>") + " New | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<d>") + " Delete | " + keyStyle.Render("<s>") + " SSH | " + keyStyle.Render("<q>") + " Quit"
-	} else if m.currentView == "clusters" {
+	} else if m.currentView == viewClusters {
 		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<enter>") + " Enter | " + keyStyle.Render("<q>") + " Quit"
 	} else {
 		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<:>") + " Command | " + keyStyle.Render("<d>") + " Next | " + keyStyle.Render("<n>") + " Namespace | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<esc>") + " Back | " + keyStyle.Render("<q>") + " Quit"
@@ -1903,7 +2639,7 @@ func (m model) renderTopBarThreePanel() string {
 	leftPanelContent := accountInfo.String()
 	// CRITICAL: Ensure content is not empty
 	if strings.TrimSpace(leftPanelContent) == "" {
-		leftPanelContent = fmt.Sprintf("DigitalOcean\n\nDroplets: %d\nRegion: %s\nRefresh: N/A\nVersion: dogoctl v1.1.0",
+		leftPanelContent = fmt.Sprintf("DigitalOcean\n\nDroplets: %d\nRegion: %s\nRefresh: N/A\nVersion: dogoctl v1.2.0",
 			m.dropletCount, m.selectedRegion)
 	}
 	// Render with proper width - ensure content is visible
@@ -2001,45 +2737,132 @@ func truncateString(s string, maxLen int) string {
 func (m model) renderStatusBar() string {
 	// k9s-style footer showing current view type
 	var statusText string
-	if m.currentView == "cluster-resources" {
+	if m.currentView == viewClusterResources {
 		// Show cluster resource view
 		if m.selectedCluster != nil {
 			statusText = fmt.Sprintf("<%s>", m.clusterResourceType)
-			statusText = fmt.Sprintf("%s | Cluster: %s | Resource: %s", statusText, m.selectedCluster.Name, strings.Title(m.clusterResourceType))
+			clusterName := m.selectedCluster.Name
+			// Truncate cluster name if needed
+			if len(clusterName) > 20 {
+				clusterName = clusterName[:17] + "..."
+			}
+			statusText = fmt.Sprintf("%s | Cluster: %s | Resource: %s", statusText, clusterName, strings.Title(m.clusterResourceType))
 		}
-	} else if m.currentView == "clusters" {
-		statusText = fmt.Sprintf("<clusters>")
-		statusText = fmt.Sprintf("%s | Clusters [%d]", statusText, m.clusterCount)
+	} else if m.currentView == viewClusters {
+		statusText = fmt.Sprintf("<clusters> | Clusters [%d]", m.clusterCount)
 	} else {
-		statusText = fmt.Sprintf("<droplets>")
-		if m.selectedRegion != "all" {
-			statusText = fmt.Sprintf("<droplets> [%s]", m.selectedRegion)
+		statusText = "<droplets>"
+		region := m.selectedRegion
+		// Truncate region if too long
+		if len(region) > 15 {
+			region = region[:12] + "..."
 		}
-		statusText = fmt.Sprintf("%s | Droplets(%s) [%d]", statusText, m.selectedRegion, m.dropletCount)
+		statusText = fmt.Sprintf("%s | Droplets(%s) [%d]", statusText, region, m.dropletCount)
 	}
-	
+
 	if m.loading {
 		statusText = fmt.Sprintf("%s | %s Loading...", statusText, m.spinner.View())
 	}
-	
+
 	// Make status bar responsive to width
 	width := m.width
 	if width < 40 {
 		width = 40
 	}
-	
-	// Truncate if too long
+
+	// Truncate if too long - be more aggressive with truncation
 	maxStatusLen := width - 4
-	if len(statusText) > maxStatusLen {
-		statusText = statusText[:maxStatusLen-3] + "..."
+	if maxStatusLen < 20 {
+		maxStatusLen = 20 // Minimum readable length
 	}
-	
+	if len(statusText) > maxStatusLen {
+		// Try to preserve important info (view type and count) while truncating
+		if m.currentView == viewDroplets {
+			// Preserve: "<droplets> | Droplets(...) [N]"
+			shortText := fmt.Sprintf("<droplets> | [%d]", m.dropletCount)
+			if len(shortText) <= maxStatusLen {
+				statusText = shortText
+			} else {
+				statusText = statusText[:maxStatusLen-3] + "..."
+			}
+		} else if m.currentView == viewClusters {
+			shortText := fmt.Sprintf("<clusters> | [%d]", m.clusterCount)
+			if len(shortText) <= maxStatusLen {
+				statusText = shortText
+			} else {
+				statusText = statusText[:maxStatusLen-3] + "..."
+			}
+		} else {
+			statusText = statusText[:maxStatusLen-3] + "..."
+		}
+	}
+
 	return lipgloss.NewStyle().
 		Foreground(mutedColor).
 		Background(bgColor).
 		Padding(0, 1).
 		Width(width).
 		Render(statusText)
+}
+
+func (m model) renderSSHIPSelection() string {
+	if m.selectedDroplet == nil {
+		return ""
+	}
+
+	publicIP := getPublicIP(*m.selectedDroplet)
+	privateIP := getPrivateIP(*m.selectedDroplet)
+
+	var s strings.Builder
+	s.WriteString("\n")
+	s.WriteString(headerStyle.Render("🔌 Select IP Address for SSH"))
+	s.WriteString("\n\n")
+
+	s.WriteString(fmt.Sprintf("Droplet: %s\n\n", m.selectedDroplet.Name))
+
+	if publicIP != "" {
+		selected := ""
+		if m.sshIPType == "public" {
+			selected = " ← "
+		}
+		publicStyle := lipgloss.NewStyle().Foreground(successColor).Bold(true)
+		if m.sshIPType == "public" {
+			publicStyle = publicStyle.Foreground(highlightColor)
+		}
+		s.WriteString(fmt.Sprintf("  %s %s Public IP:  %s%s\n",
+			selected,
+			keyStyle.Render("[1]"),
+			publicStyle.Render(publicIP),
+			selected))
+	}
+
+	if privateIP != "" {
+		selected := ""
+		if m.sshIPType == "private" {
+			selected = " ← "
+		}
+		privateStyle := lipgloss.NewStyle().Foreground(successColor).Bold(true)
+		if m.sshIPType == "private" {
+			privateStyle = privateStyle.Foreground(highlightColor)
+		}
+		s.WriteString(fmt.Sprintf("  %s %s Private IP: %s%s\n",
+			selected,
+			keyStyle.Render("[2]"),
+			privateStyle.Render(privateIP),
+			selected))
+	}
+
+	s.WriteString("\n")
+	s.WriteString(helpStyle.Render("Press [1] or [p] for Public IP | [2] or [r] for Private IP | [esc] to cancel"))
+
+	content := lipgloss.NewStyle().
+		Width(m.width-4).
+		Padding(2, 4).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Render(s.String())
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
 }
 
 func (m model) renderDeleteConfirmation() string {
@@ -2078,6 +2901,11 @@ func (m model) renderDeleteConfirmation() string {
 }
 
 func (m model) renderCreateForm() string {
+	// If in selection mode, show selection table
+	if m.selectingRegion || m.selectingSize || m.selectingImage {
+		return m.renderSelectionView()
+	}
+
 	var s strings.Builder
 	s.WriteString("\n")
 
@@ -2085,32 +2913,78 @@ func (m model) renderCreateForm() string {
 	s.WriteString(formTitle)
 	s.WriteString("\n\n")
 
-	inputs := []struct {
-		label string
-		input textinput.Model
-		hint  string
-	}{
-		{"Name:", m.nameInput, "e.g., my-droplet"},
-		{"Region:", m.regionInput, "e.g., nyc3, sfo3, ams3"},
-		{"Size:", m.sizeInput, "e.g., s-1vcpu-1gb, s-2vcpu-4gb"},
-		{"Image:", m.imageInput, "e.g., ubuntu-22-04-x64"},
-		{"Tags:", m.tagsInput, "comma-separated, e.g., web,production"},
+	// Name field
+	labelStyle := lipgloss.NewStyle().Width(20).Foreground(mutedColor)
+	if m.inputIndex == 0 {
+		labelStyle = labelStyle.Foreground(primaryColor).Bold(true)
 	}
-
-	for i, item := range inputs {
-		labelStyle := lipgloss.NewStyle().Width(20).Foreground(mutedColor)
-		if i == m.inputIndex {
-			labelStyle = labelStyle.Foreground(primaryColor).Bold(true)
-		}
-
-		hintStyle := lipgloss.NewStyle().Foreground(mutedColor).Italic(true)
-
-		s.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render(item.label), item.input.View()))
-		if i == m.inputIndex {
-			s.WriteString(fmt.Sprintf("   %s\n", hintStyle.Render(item.hint)))
-		}
-		s.WriteString("\n")
+	s.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Name:"), m.nameInput.View()))
+	if m.inputIndex == 0 {
+		s.WriteString(fmt.Sprintf("   %s\n", lipgloss.NewStyle().Foreground(mutedColor).Italic(true).Render("e.g., my-droplet")))
 	}
+	s.WriteString("\n")
+
+	// Region field (selection)
+	regionLabelStyle := lipgloss.NewStyle().Width(20).Foreground(mutedColor)
+	if m.inputIndex == 1 {
+		regionLabelStyle = regionLabelStyle.Foreground(primaryColor).Bold(true)
+	}
+	regionValue := m.selectedRegionSlug
+	if regionValue == "" {
+		regionValue = lipgloss.NewStyle().Foreground(mutedColor).Italic(true).Render("Press Enter to select")
+	} else {
+		regionValue = lipgloss.NewStyle().Foreground(successColor).Render(regionValue)
+	}
+	s.WriteString(fmt.Sprintf("%s %s\n", regionLabelStyle.Render("Region:"), regionValue))
+	if m.inputIndex == 1 {
+		s.WriteString(fmt.Sprintf("   %s\n", lipgloss.NewStyle().Foreground(mutedColor).Italic(true).Render("Press Enter to select from list")))
+	}
+	s.WriteString("\n")
+
+	// Size field (selection)
+	sizeLabelStyle := lipgloss.NewStyle().Width(20).Foreground(mutedColor)
+	if m.inputIndex == 2 {
+		sizeLabelStyle = sizeLabelStyle.Foreground(primaryColor).Bold(true)
+	}
+	sizeValue := m.selectedSizeSlug
+	if sizeValue == "" {
+		sizeValue = lipgloss.NewStyle().Foreground(mutedColor).Italic(true).Render("Press Enter to select")
+	} else {
+		sizeValue = lipgloss.NewStyle().Foreground(successColor).Render(sizeValue)
+	}
+	s.WriteString(fmt.Sprintf("%s %s\n", sizeLabelStyle.Render("Size:"), sizeValue))
+	if m.inputIndex == 2 {
+		s.WriteString(fmt.Sprintf("   %s\n", lipgloss.NewStyle().Foreground(mutedColor).Italic(true).Render("Press Enter to select from list")))
+	}
+	s.WriteString("\n")
+
+	// Image field (selection)
+	imageLabelStyle := lipgloss.NewStyle().Width(20).Foreground(mutedColor)
+	if m.inputIndex == 3 {
+		imageLabelStyle = imageLabelStyle.Foreground(primaryColor).Bold(true)
+	}
+	imageValue := m.selectedImageSlug
+	if imageValue == "" {
+		imageValue = lipgloss.NewStyle().Foreground(mutedColor).Italic(true).Render("Press Enter to select")
+	} else {
+		imageValue = lipgloss.NewStyle().Foreground(successColor).Render(imageValue)
+	}
+	s.WriteString(fmt.Sprintf("%s %s\n", imageLabelStyle.Render("Image:"), imageValue))
+	if m.inputIndex == 3 {
+		s.WriteString(fmt.Sprintf("   %s\n", lipgloss.NewStyle().Foreground(mutedColor).Italic(true).Render("Press Enter to select from list")))
+	}
+	s.WriteString("\n")
+
+	// Tags field
+	tagsLabelStyle := lipgloss.NewStyle().Width(20).Foreground(mutedColor)
+	if m.inputIndex == 4 {
+		tagsLabelStyle = tagsLabelStyle.Foreground(primaryColor).Bold(true)
+	}
+	s.WriteString(fmt.Sprintf("%s %s\n", tagsLabelStyle.Render("Tags:"), m.tagsInput.View()))
+	if m.inputIndex == 4 {
+		s.WriteString(fmt.Sprintf("   %s\n", lipgloss.NewStyle().Foreground(mutedColor).Italic(true).Render("comma-separated, e.g., web,production")))
+	}
+	s.WriteString("\n")
 
 	if m.loading {
 		s.WriteString(fmt.Sprintf("  %s Creating droplet...\n\n", m.spinner.View()))
@@ -2121,7 +2995,33 @@ func (m model) renderCreateForm() string {
 		s.WriteString("\n")
 	}
 
-	helpText := helpStyle.Render("[tab] Next  [shift+tab] Previous  [enter] Create  [esc] Cancel")
+	helpText := helpStyle.Render("[tab] Next  [shift+tab] Previous  [enter] Select/Create  [esc] Cancel")
+	s.WriteString(helpText)
+	s.WriteString("\n")
+
+	return s.String()
+}
+
+func (m model) renderSelectionView() string {
+	var s strings.Builder
+	s.WriteString("\n")
+
+	var title string
+	if m.selectingRegion {
+		title = headerStyle.Render("📍 Select Region")
+	} else if m.selectingSize {
+		title = headerStyle.Render("💾 Select Size")
+	} else if m.selectingImage {
+		title = headerStyle.Render("🖼️  Select Image")
+	}
+	s.WriteString(title)
+	s.WriteString("\n\n")
+
+	// Render selection table
+	s.WriteString(m.selectionTable.View())
+	s.WriteString("\n\n")
+
+	helpText := helpStyle.Render("[↑/↓] Navigate  [enter] Select  [esc] Cancel")
 	s.WriteString(helpText)
 	s.WriteString("\n")
 
@@ -2184,21 +3084,27 @@ func (m model) renderDropletDetails() string {
 		{"📅 Created:", d.Created},
 	}
 
-	// IP Addresses
-	var ipv4s []string
-	var ipv6s []string
-	for _, v4 := range d.Networks.V4 {
-		ipv4s = append(ipv4s, v4.IPAddress)
-	}
-	for _, v6 := range d.Networks.V6 {
-		ipv6s = append(ipv6s, v6.IPAddress)
-	}
+	// IP Addresses - show public and private separately
+	publicIP := getPublicIP(*d)
+	privateIP := getPrivateIP(*d)
 
-	if len(ipv4s) > 0 {
+	if publicIP != "" {
 		details = append(details, struct {
 			label string
 			value string
-		}{"🌐 IPv4:", strings.Join(ipv4s, ", ")})
+		}{"🌐 Public IP:", publicIP})
+	}
+	if privateIP != "" {
+		details = append(details, struct {
+			label string
+			value string
+		}{"🔒 Private IP:", privateIP})
+	}
+
+	// Show IPv6 if available
+	var ipv6s []string
+	for _, v6 := range d.Networks.V6 {
+		ipv6s = append(ipv6s, v6.IPAddress)
 	}
 	if len(ipv6s) > 0 {
 		details = append(details, struct {
@@ -2248,7 +3154,11 @@ func (m model) renderDropletDetails() string {
 	s.WriteString(detailsBox.Render(detailsContent.String()))
 	s.WriteString("\n\n")
 
+	// Show SSH option if droplet is active and has IP addresses (publicIP and privateIP already declared above)
 	helpText := helpStyle.Render("[esc/enter] Back  [q] Quit")
+	if d.Status == "active" && (publicIP != "" || privateIP != "") {
+		helpText = helpStyle.Render("[esc/enter] Back  [s] SSH  [q] Quit")
+	}
 	s.WriteString(helpText)
 	s.WriteString("\n")
 
@@ -2387,44 +3297,44 @@ func loadClusters(client *godo.Client) tea.Cmd {
 func loadClusterResources(client *godo.Client, cluster *godo.KubernetesCluster, resourceType string, namespace string) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
-		
+
 		// Get kubeconfig for the cluster
 		kubeconfigResp, _, err := client.Kubernetes.GetKubeConfig(ctx, cluster.ID)
 		if err != nil {
 			return errMsg(fmt.Errorf("failed to get kubeconfig: %v", err))
 		}
-		
+
 		// Kubeconfig is already bytes, no need to decode
 		kubeconfigBytes := kubeconfigResp.KubeconfigYAML
-		
+
 		// Parse kubeconfig
 		config, err := clientcmd.Load(kubeconfigBytes)
 		if err != nil {
 			return errMsg(fmt.Errorf("failed to parse kubeconfig: %v", err))
 		}
-		
+
 		// Create client config
 		clientConfig := clientcmd.NewDefaultClientConfig(*config, &clientcmd.ConfigOverrides{})
 		restConfig, err := clientConfig.ClientConfig()
 		if err != nil {
 			return errMsg(fmt.Errorf("failed to create client config: %v", err))
 		}
-		
+
 		// Create Kubernetes client
 		k8sClient, err := kubernetes.NewForConfig(restConfig)
 		if err != nil {
 			return errMsg(fmt.Errorf("failed to create k8s client: %v", err))
 		}
-		
+
 		// Fetch resources based on type
 		resources := []map[string]interface{}{}
-		
+
 		// Determine namespace - empty string means all namespaces
 		ns := namespace
 		if ns == "" {
 			ns = metav1.NamespaceAll
 		}
-		
+
 		switch resourceType {
 		case "deployments":
 			deployments, err := k8sClient.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
@@ -2653,11 +3563,11 @@ func loadClusterResources(client *godo.Client, cluster *godo.KubernetesCluster, 
 						roles = "master"
 					}
 					resources = append(resources, map[string]interface{}{
-						"name":     n.Name,
-						"status":   status,
-						"roles":    roles,
-						"age":      age,
-						"version":  n.Status.NodeInfo.KubeletVersion,
+						"name":    n.Name,
+						"status":  status,
+						"roles":   roles,
+						"age":     age,
+						"version": n.Status.NodeInfo.KubeletVersion,
 					})
 				}
 			}
@@ -2686,7 +3596,7 @@ func loadClusterResources(client *godo.Client, cluster *godo.KubernetesCluster, 
 				}
 			}
 		}
-		
+
 		return clusterResourcesLoadedMsg{
 			resourceType: resourceType,
 			resources:    resources,
@@ -2705,12 +3615,137 @@ func loadAccountInfo(client *godo.Client) tea.Cmd {
 	}
 }
 
+func loadRegions(client *godo.Client) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		opt := &godo.ListOptions{PerPage: 200}
+		regions, _, err := client.Regions.List(ctx, opt)
+		if err != nil {
+			return errMsg(err)
+		}
+		return regionsLoadedMsg(regions)
+	}
+}
+
+func loadSizes(client *godo.Client) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		opt := &godo.ListOptions{PerPage: 200}
+		sizes, _, err := client.Sizes.List(ctx, opt)
+		if err != nil {
+			return errMsg(err)
+		}
+		return sizesLoadedMsg(sizes)
+	}
+}
+
+func loadImages(client *godo.Client) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		opt := &godo.ListOptions{PerPage: 200}
+		images, _, err := client.Images.List(ctx, opt)
+		if err != nil {
+			return errMsg(err)
+		}
+		// Filter to only specific distributions: Ubuntu, Fedora, Debian, CentOS, AlmaLinux, Rocky Linux
+		// Only x86/x64 architectures
+		// Based on actual doctl output: slugs like "ubuntu-22-04-x64", "debian-12-x64", "rockylinux-9-x64", etc.
+		allowedDistSlugPrefixes := []string{
+			"ubuntu-",
+			"fedora-",
+			"debian-",
+			"centos-",        // Matches "centos-stream-9-x64"
+			"centos-stream-", // Explicit match for centos-stream
+			"almalinux-",
+			"rockylinux-",
+		}
+
+		allowedDistNames := []string{
+			"ubuntu",
+			"fedora",
+			"debian",
+			"centos",
+			"almalinux",
+			"rocky linux", // Distribution field uses "Rocky Linux" with space
+		}
+
+		var validImages []godo.Image
+		for _, img := range images {
+			// Must have a slug
+			if img.Slug == "" {
+				continue
+			}
+
+			slugLower := strings.ToLower(img.Slug)
+
+			// Exclude ARM architectures
+			if strings.Contains(slugLower, "-arm") || strings.Contains(slugLower, "_arm") ||
+				strings.Contains(slugLower, "-aarch64") || strings.Contains(slugLower, "_aarch64") {
+				continue
+			}
+
+			// Exclude GPU images
+			if strings.HasPrefix(slugLower, "gpu-") {
+				continue
+			}
+
+			// Check if slug starts with any allowed distribution prefix
+			slugMatches := false
+			for _, prefix := range allowedDistSlugPrefixes {
+				if strings.HasPrefix(slugLower, prefix) {
+					slugMatches = true
+					break
+				}
+			}
+
+			// Also check distribution field as fallback
+			distLower := strings.ToLower(strings.TrimSpace(img.Distribution))
+			distMatches := false
+			if !slugMatches && distLower != "" {
+				for _, allowedDist := range allowedDistNames {
+					if distLower == allowedDist ||
+						strings.Contains(distLower, allowedDist) ||
+						(allowedDist == "rocky linux" && strings.Contains(distLower, "rocky")) ||
+						(allowedDist == "almalinux" && strings.Contains(distLower, "alma")) {
+						distMatches = true
+						break
+					}
+				}
+			}
+
+			// Must match either slug or distribution
+			if !slugMatches && !distMatches {
+				continue
+			}
+
+			// Must be x86 or x64 architecture (all distribution images should have this in slug)
+			// Check slug first (most reliable)
+			hasX64 := strings.Contains(slugLower, "-x64") || strings.Contains(slugLower, "_x64") ||
+				strings.Contains(slugLower, "-amd64") || strings.Contains(slugLower, "_amd64")
+			hasX86 := strings.Contains(slugLower, "-x86") || strings.Contains(slugLower, "_x86")
+
+			// If not found in slug, check name as fallback
+			if !hasX64 && !hasX86 {
+				nameLower := strings.ToLower(img.Name)
+				hasX64 = strings.Contains(nameLower, "x64") || strings.Contains(nameLower, "amd64")
+				hasX86 = strings.Contains(nameLower, "x86")
+			}
+
+			// Include if it has x86 or x64 architecture
+			if hasX64 || hasX86 {
+				validImages = append(validImages, img)
+			}
+		}
+		return imagesLoadedMsg(validImages)
+	}
+}
+
 func createDroplet(client *godo.Client, m model) tea.Cmd {
 	return func() tea.Msg {
 		name := strings.TrimSpace(m.nameInput.Value())
-		region := strings.TrimSpace(m.regionInput.Value())
-		size := strings.TrimSpace(m.sizeInput.Value())
-		image := strings.TrimSpace(m.imageInput.Value())
+		region := m.selectedRegionSlug
+		size := m.selectedSizeSlug
+		image := m.selectedImageSlug
 		tagsStr := strings.TrimSpace(m.tagsInput.Value())
 
 		if name == "" || region == "" || size == "" || image == "" {
@@ -2763,19 +3798,19 @@ func deleteDroplet(client *godo.Client, id int) tea.Cmd {
 // This should be called after the tea program exits
 func executeSSH(ip, name string) error {
 	fmt.Printf("\n🔌 Connecting to %s (%s)...\n\n", name, ip)
-	
+
 	// SSH command
 	cmd := exec.Command("ssh", ip)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	// Execute SSH (this will block until SSH session ends)
 	err := cmd.Run()
 	if err != nil {
 		return fmt.Errorf("SSH connection to %s (%s) failed: %v", name, ip, err)
 	}
-	
+
 	return nil
 }
 
@@ -2803,7 +3838,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
 			os.Exit(1)
 		}
-		
+
 		// If SSH was requested, execute it now (after program exits)
 		if sshIP != "" {
 			ip := sshIP
@@ -2811,7 +3846,7 @@ func main() {
 			// Clear SSH info before executing (so we can restart TUI after)
 			sshIP = ""
 			sshName = ""
-			
+
 			if err := executeSSH(ip, name); err != nil {
 				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 				// Continue loop to restart TUI even if SSH fails
@@ -2819,7 +3854,7 @@ func main() {
 			// After SSH exits, continue loop to restart TUI
 			continue
 		}
-		
+
 		// If no SSH was requested, exit normally
 		break
 	}

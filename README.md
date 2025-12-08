@@ -4,14 +4,14 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets an
 
 ![dogoctl](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Version](https://img.shields.io/badge/version-1.1.0-blue)
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
 
 ## ✨ Features
 
 ### Droplet Management
 - 🖥️ **Interactive TUI**: Navigate and manage droplets with intuitive keyboard shortcuts
 - 📋 **List Droplets**: View all your droplets with status indicators, region, size, and IP information
-- ➕ **Create Droplets**: Interactive form with helpful hints to create new droplets
+- ➕ **Create Droplets**: Interactive form with dropdown selection for region, size, and image
 - 🗑️ **Delete Droplets**: Safe deletion with confirmation dialogs
 - 🔌 **SSH Connection**: Quick SSH access to droplets directly from the TUI
 - 🔄 **Real-time Refresh**: Reload droplet list with loading indicators
@@ -155,8 +155,10 @@ Press `<esc>` to cancel command mode.
 |-----|--------|
 | `tab` | Move to next field |
 | `shift+tab` | Move to previous field |
-| `enter` | Create droplet (on last field) |
-| `esc` | Cancel and return to list |
+| `enter` | Open selection (region/size/image) or create droplet (on tags field) |
+| `↑/↓` | Navigate selection table (when selecting region/size/image) |
+| `enter` | Confirm selection (when in selection mode) |
+| `esc` | Cancel selection or cancel form |
 
 ### Details View
 | Key | Action |
@@ -174,15 +176,25 @@ Press `<esc>` to cancel command mode.
 
 1. Press `n` to open the create form
 2. Fill in the required fields:
-   - **Name**: Droplet name (e.g., `my-droplet`)
-   - **Region**: Region slug (e.g., `nyc3`, `sfo3`, `ams3`)
-   - **Size**: Size slug (e.g., `s-1vcpu-1gb`, `s-2vcpu-2gb`)
-   - **Image**: Image slug (e.g., `ubuntu-22-04-x64`, `debian-12-x64`)
-   - **Tags**: Comma-separated tags (e.g., `web,production`)
+   - **Name**: Type the droplet name (e.g., `my-droplet`)
+   - **Region**: Press `Enter` to open region selection table, then select from available regions
+   - **Size**: Press `Enter` to open size selection table showing vCPU, RAM, disk, and price
+   - **Image**: Press `Enter` to open image selection table with 6 distributions:
+     - Ubuntu
+     - Fedora
+     - Debian
+     - CentOS
+     - AlmaLinux
+     - Rocky Linux
+     - All images are x86/x64 architecture only
+   - **Tags**: Type comma-separated tags (e.g., `web,production`)
 3. Use `Tab`/`Shift+Tab` to navigate between fields
-4. Each field shows helpful hints when focused
-5. Press `Enter` on the last field to create the droplet
-6. Press `Esc` to cancel
+4. When selecting region/size/image:
+   - Use `↑/↓` to navigate the selection table
+   - Press `Enter` to confirm selection
+   - Press `Esc` to cancel selection
+5. Press `Enter` on the tags field to create the droplet
+6. Press `Esc` to cancel the form
 
 ## 🔌 SSH Connection
 
@@ -257,11 +269,15 @@ Press `<esc>` to cancel command mode.
 - `s-4vcpu-8gb` - Basic (4 vCPU, 8GB RAM) - $48/mo
 
 ### Images
-- `ubuntu-22-04-x64` - Ubuntu 22.04 LTS
-- `ubuntu-24-04-x64` - Ubuntu 24.04 LTS
-- `debian-12-x64` - Debian 12
-- `fedora-40-x64` - Fedora 40
-- `rockylinux-9-x64` - Rocky Linux 9
+The image selection shows 6 supported distributions (x86/x64 only):
+- **Ubuntu**: `ubuntu-22-04-x64`, `ubuntu-24-04-x64`, `ubuntu-25-04-x64`, etc.
+- **Fedora**: `fedora-42-x64`, etc.
+- **Debian**: `debian-12-x64`, `debian-13-x64`, etc.
+- **CentOS**: `centos-stream-9-x64`, `centos-stream-10-x64`, etc.
+- **AlmaLinux**: `almalinux-8-x64`, `almalinux-9-x64`, `almalinux-10-x64`, etc.
+- **Rocky Linux**: `rockylinux-8-x64`, `rockylinux-9-x64`, `rockylinux-10-x64`, etc.
+
+All images are automatically filtered to show only x86/x64 architectures.
 
 ## 💡 Example
 
@@ -369,6 +385,17 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 For issues, questions, or contributions, please open an issue on GitHub.
 
 ## 📋 Changelog
+
+### v1.2.0 (2024)
+- **Interactive Selection for Droplet Creation**: 
+  - Region selection from dropdown table
+  - Size selection with vCPU, RAM, disk, and price information
+  - Image selection with 6 supported distributions (Ubuntu, Fedora, Debian, CentOS, AlmaLinux, Rocky Linux)
+  - Only x86/x64 images are shown
+  - Simplified workflow: only name and tags require typing
+- Improved rendering for iTerm windows
+- Better text truncation and responsive column widths
+- Enhanced table rendering for small terminal sizes
 
 ### v1.1.0 (2024)
 - SSH connection support for droplets
