@@ -81,9 +81,16 @@ type model struct {
 	selectedImageSlug  string      // Selected image slug for creation
 	selectionTable     table.Model // Table for selecting region/size/image
 	// Billing dashboard state
-	billingBalance     *godo.Balance
-	billingInvoices    []godo.InvoiceListItem
-	billingHistory     *godo.BillingHistory
+	billingBalance        *godo.Balance
+	billingInvoices       []godo.InvoiceListItem
+	billingHistory        *godo.BillingHistory
+	billingMode           string                    // "invoices" or "monthly" - which view to show
+	selectedBillingMonth  string                    // Selected month for detailed view (format: "YYYY-MM")
+	viewingBillingDetails bool                      // When true, show detailed billing information
+	selectedInvoice       *godo.InvoiceListItem     // Selected invoice for details
+	selectedBillingEntry  *godo.BillingHistoryEntry // Selected billing entry for details
+	detailedInvoice       *godo.Invoice             // Full invoice details loaded from API
+	billingDetailsScroll  int                       // Scroll position for billing details view
 }
 
 type errMsg error
@@ -104,6 +111,7 @@ type imagesLoadedMsg []godo.Image
 type balanceLoadedMsg *godo.Balance
 type invoicesLoadedMsg []godo.InvoiceListItem
 type billingHistoryLoadedMsg *godo.BillingHistory
+type invoiceDetailsLoadedMsg *godo.Invoice
 
 const (
 	viewDroplets         = "droplets"
@@ -299,9 +307,16 @@ func initialModel(client *godo.Client) model {
 			selTable.SetStyles(selStyles)
 			return selTable
 		}(),
-		billingBalance:     nil,
-		billingInvoices:    []godo.InvoiceListItem{},
-		billingHistory:     nil,
+		billingBalance:        nil,
+		billingInvoices:       []godo.InvoiceListItem{},
+		billingHistory:        nil,
+		billingMode:           "invoices", // Default to invoices view
+		selectedBillingMonth:  "",
+		viewingBillingDetails: false,
+		selectedInvoice:       nil,
+		selectedBillingEntry:  nil,
+		detailedInvoice:       nil,
+		billingDetailsScroll:  0,
 	}
 }
 
@@ -338,6 +353,71 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.creating {
 			return m.updateCreateForm(msg)
+		}
+
+		if m.viewingBillingDetails {
+			key := msg.String()
+			switch {
+			case key == "esc" || key == "enter" || key == "backspace":
+				m.viewingBillingDetails = false
+				m.selectedInvoice = nil
+				m.selectedBillingEntry = nil
+				m.detailedInvoice = nil
+				m.billingDetailsScroll = 0
+				return m, nil
+			case key == "up" || key == "k" || key == "K":
+				// Scroll up
+				if m.billingDetailsScroll > 0 {
+					m.billingDetailsScroll--
+				}
+				return m, nil
+			case key == "down" || key == "j" || key == "J":
+				// Scroll down
+				m.billingDetailsScroll++
+				return m, nil
+			case key == "pageup" || key == "ctrl+b":
+				// Page up
+				m.billingDetailsScroll = max(0, m.billingDetailsScroll-10)
+				return m, nil
+			case key == "pagedown" || key == "ctrl+f":
+				// Page down
+				m.billingDetailsScroll += 10
+				return m, nil
+			case key == "home" || key == "g":
+				// Go to top
+				m.billingDetailsScroll = 0
+				return m, nil
+			case key == "end" || key == "G":
+				// Go to bottom (will be limited by content height in render)
+				m.billingDetailsScroll = 9999
+				return m, nil
+			case key == "ctrl+c" || key == "q":
+				return m, tea.Quit
+			}
+			// Also check key type for arrow keys
+			switch msg.Type {
+			case tea.KeyUp:
+				if m.billingDetailsScroll > 0 {
+					m.billingDetailsScroll--
+				}
+				return m, nil
+			case tea.KeyDown:
+				m.billingDetailsScroll++
+				return m, nil
+			case tea.KeyPgUp:
+				m.billingDetailsScroll = max(0, m.billingDetailsScroll-10)
+				return m, nil
+			case tea.KeyPgDown:
+				m.billingDetailsScroll += 10
+				return m, nil
+			case tea.KeyHome:
+				m.billingDetailsScroll = 0
+				return m, nil
+			case tea.KeyEnd:
+				m.billingDetailsScroll = 9999
+				return m, nil
+			}
+			return m, nil
 		}
 
 		if m.viewingDetails {
@@ -632,6 +712,72 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.loading = true
 					return m, tea.Batch(loadClusterResources(m.client, m.selectedCluster, m.clusterResourceType, m.selectedNamespace), m.spinner.Tick)
+				} else if m.currentView == viewBilling {
+					if m.billingMode == "monthly" && m.selectedBillingMonth == "" {
+						// Enter month to see details - convert "Jan 2024" back to "2024-01"
+						monthDisplay := selectedName
+						// Try to parse the month display format
+						if parsedTime, err := time.Parse("Jan 2006", monthDisplay); err == nil {
+							m.selectedBillingMonth = parsedTime.Format("2006-01")
+							m.updateBillingTable()
+						} else if _, err := time.Parse("2006-01", monthDisplay); err == nil {
+							// Already in YYYY-MM format
+							m.selectedBillingMonth = monthDisplay
+							m.updateBillingTable()
+						}
+					} else if m.billingMode == "monthly" && m.selectedBillingMonth != "" {
+						// Enter billing entry to see details
+						selectedRow := m.table.SelectedRow()
+						if len(selectedRow) >= 5 {
+							// Find the entry by date and description
+							dateStr := selectedRow[0]
+							description := selectedRow[1]
+							monthlyData := groupBillingByMonth(m.billingHistory)
+							entries := monthlyData[m.selectedBillingMonth]
+							for i := range entries {
+								if entries[i].Date.Format("2006-01-02") == dateStr && strings.Contains(entries[i].Description, strings.TrimSuffix(description, "...")) {
+									m.viewingBillingDetails = true
+									m.selectedBillingEntry = &entries[i]
+									m.selectedInvoice = nil
+									m.billingDetailsScroll = 0 // Reset scroll position
+									break
+								}
+							}
+						}
+					} else if m.billingMode == "invoices" {
+						// Enter invoice to see details
+						selectedRow := m.table.SelectedRow()
+						if len(selectedRow) >= 1 {
+							uuid := selectedRow[0]
+							var invoiceUUID string
+							// Remove truncation if present
+							if strings.HasSuffix(uuid, "...") {
+								// Find full UUID
+								for i := range m.billingInvoices {
+									if strings.HasPrefix(m.billingInvoices[i].InvoiceUUID, uuid[:len(uuid)-3]) {
+										m.selectedInvoice = &m.billingInvoices[i]
+										invoiceUUID = m.billingInvoices[i].InvoiceUUID
+										break
+									}
+								}
+							} else {
+								// Find by exact UUID
+								for i := range m.billingInvoices {
+									if m.billingInvoices[i].InvoiceUUID == uuid {
+										m.selectedInvoice = &m.billingInvoices[i]
+										invoiceUUID = m.billingInvoices[i].InvoiceUUID
+										break
+									}
+								}
+							}
+							// Load detailed invoice information
+							if invoiceUUID != "" {
+								m.loading = true
+								m.selectedBillingEntry = nil
+								return m, tea.Batch(loadInvoiceDetails(m.client, invoiceUUID), m.spinner.Tick)
+							}
+						}
+					}
 				}
 			}
 			return m, nil
@@ -650,12 +796,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		case "m", "M":
+			// Switch to monthly billing view
+			if m.currentView == viewBilling {
+				m.billingMode = "monthly"
+				m.selectedBillingMonth = "" // Reset to monthly summary
+				m.updateBillingTable()
+			}
+			return m, nil
+		case "i", "I":
+			// Switch to invoices view
+			if m.currentView == viewBilling {
+				m.billingMode = "invoices"
+				m.selectedBillingMonth = "" // Clear month selection
+				m.updateBillingTable()
+			}
+			return m, nil
 		case "esc":
 			// Go back from cluster resources to clusters list
 			if m.currentView == viewClusterResources {
 				m.currentView = viewClusters
 				m.selectedCluster = nil
 				m.updateTableRows()
+				return m, nil
+			}
+			// Go back from month details to monthly summary
+			if m.currentView == viewBilling && m.billingMode == "monthly" && m.selectedBillingMonth != "" {
+				m.selectedBillingMonth = ""
+				m.updateBillingTable()
 				return m, nil
 			}
 			return m, nil
@@ -741,11 +909,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case invoicesLoadedMsg:
 		m.billingInvoices = msg
 		m.loading = false
+		// Update billing table after invoices are loaded
+		if m.currentView == viewBilling {
+			m.updateBillingTable()
+		}
 		return m, nil
 
 	case billingHistoryLoadedMsg:
 		m.billingHistory = msg
 		m.loading = false
+		// Update billing table after history is loaded
+		if m.currentView == viewBilling {
+			m.updateBillingTable()
+		}
+		return m, nil
+
+	case invoiceDetailsLoadedMsg:
+		m.detailedInvoice = msg
+		m.loading = false
+		m.viewingBillingDetails = true
+		m.billingDetailsScroll = 0 // Reset scroll position when loading new invoice
 		return m, nil
 
 	case dropletCreatedMsg:
@@ -1363,6 +1546,50 @@ func (m *model) updateTableRows() {
 	m.table.SetRows(rows)
 }
 
+// Helper function to parse amount string and return float64
+func parseAmount(amountStr string) float64 {
+	// Remove $ and commas, then parse
+	cleaned := strings.ReplaceAll(strings.ReplaceAll(amountStr, "$", ""), ",", "")
+	val, err := strconv.ParseFloat(cleaned, 64)
+	if err != nil {
+		return 0.0
+	}
+	return val
+}
+
+// Helper function to format amount
+func formatAmount(amount float64) string {
+	if amount < 0 {
+		return fmt.Sprintf("-$%.2f", -amount)
+	}
+	return fmt.Sprintf("$%.2f", amount)
+}
+
+// Group billing history by month
+func groupBillingByMonth(history *godo.BillingHistory) map[string][]godo.BillingHistoryEntry {
+	monthlyData := make(map[string][]godo.BillingHistoryEntry)
+
+	if history == nil || history.BillingHistory == nil {
+		return monthlyData
+	}
+
+	for _, entry := range history.BillingHistory {
+		monthKey := entry.Date.Format("2006-01") // YYYY-MM format
+		monthlyData[monthKey] = append(monthlyData[monthKey], entry)
+	}
+
+	return monthlyData
+}
+
+// Calculate total for a month
+func calculateMonthTotal(entries []godo.BillingHistoryEntry) float64 {
+	total := 0.0
+	for _, entry := range entries {
+		total += parseAmount(entry.Amount)
+	}
+	return total
+}
+
 func (m *model) updateBillingTable() {
 	// Update table columns for billing
 	tableWidth := m.width - 2
@@ -1371,44 +1598,180 @@ func (m *model) updateBillingTable() {
 	}
 	availableWidth := tableWidth - 6
 
-	// Determine which billing section to show (default to balance/invoices)
-	// We'll show invoices in the table, balance in the top panel
-	columns := []table.Column{
-		{Title: "INVOICE UUID", Width: max(int(float64(availableWidth)*0.35), 20)},
-		{Title: "AMOUNT", Width: max(int(float64(availableWidth)*0.15), 12)},
-		{Title: "INVOICE PERIOD", Width: max(int(float64(availableWidth)*0.25), 15)},
-		{Title: "DATE", Width: max(int(float64(availableWidth)*0.25), 15)},
-	}
+	// CRITICAL: Clear rows FIRST before setting columns
+	m.table.SetRows([]table.Row{})
 
+	var columns []table.Column
 	var rows []table.Row
-	for _, inv := range m.billingInvoices {
-		// Invoice is actually InvoiceListItem with InvoiceUUID, Amount, InvoicePeriod, UpdatedAt
-		amount := inv.Amount
-		if len(amount) > 12 {
-			amount = amount[:9] + "..."
+
+	if m.billingMode == "monthly" {
+		// Monthly summary view
+		if m.selectedBillingMonth == "" {
+			// Show monthly summary
+			columns = []table.Column{
+				{Title: "MONTH", Width: max(int(float64(availableWidth)*0.30), 15)},
+				{Title: "TOTAL", Width: max(int(float64(availableWidth)*0.25), 12)},
+				{Title: "ENTRIES", Width: max(int(float64(availableWidth)*0.20), 10)},
+				{Title: "LAST ENTRY", Width: max(int(float64(availableWidth)*0.25), 15)},
+			}
+			m.table.SetColumns(columns)
+
+			monthlyData := groupBillingByMonth(m.billingHistory)
+
+			// Sort months (most recent first)
+			type monthInfo struct {
+				month    string
+				total    float64
+				count    int
+				lastDate time.Time
+			}
+			var months []monthInfo
+			for month, entries := range monthlyData {
+				total := calculateMonthTotal(entries)
+				lastDate := time.Time{}
+				for _, entry := range entries {
+					if entry.Date.After(lastDate) {
+						lastDate = entry.Date
+					}
+				}
+				months = append(months, monthInfo{
+					month:    month,
+					total:    total,
+					count:    len(entries),
+					lastDate: lastDate,
+				})
+			}
+
+			// Sort by month (descending - most recent first)
+			for i := 0; i < len(months)-1; i++ {
+				for j := i + 1; j < len(months); j++ {
+					if months[i].month < months[j].month {
+						months[i], months[j] = months[j], months[i]
+					}
+				}
+			}
+
+			for _, info := range months {
+				monthDisplay := info.month
+				// Format as "YYYY-MM" -> "Jan 2024"
+				if t, err := time.Parse("2006-01", info.month); err == nil {
+					monthDisplay = t.Format("Jan 2006")
+				}
+
+				totalStr := formatAmount(info.total)
+				if len(totalStr) > 15 {
+					totalStr = totalStr[:12] + "..."
+				}
+
+				lastDateStr := "N/A"
+				if !info.lastDate.IsZero() {
+					lastDateStr = info.lastDate.Format("2006-01-02")
+				}
+
+				rows = append(rows, table.Row{
+					monthDisplay,
+					totalStr,
+					fmt.Sprintf("%d", info.count),
+					lastDateStr,
+				})
+			}
+		} else {
+			// Show details for selected month
+			columns = []table.Column{
+				{Title: "DATE", Width: max(int(float64(availableWidth)*0.15), 12)},
+				{Title: "DESCRIPTION", Width: max(int(float64(availableWidth)*0.35), 20)},
+				{Title: "AMOUNT", Width: max(int(float64(availableWidth)*0.15), 12)},
+				{Title: "TYPE", Width: max(int(float64(availableWidth)*0.15), 12)},
+				{Title: "INVOICE UUID", Width: max(int(float64(availableWidth)*0.20), 15)},
+			}
+			m.table.SetColumns(columns)
+
+			monthlyData := groupBillingByMonth(m.billingHistory)
+			entries := monthlyData[m.selectedBillingMonth]
+
+			// Sort entries by date (most recent first)
+			for i := 0; i < len(entries)-1; i++ {
+				for j := i + 1; j < len(entries); j++ {
+					if entries[i].Date.Before(entries[j].Date) {
+						entries[i], entries[j] = entries[j], entries[i]
+					}
+				}
+			}
+
+			for _, entry := range entries {
+				dateStr := entry.Date.Format("2006-01-02")
+
+				description := entry.Description
+				if len(description) > 25 {
+					description = description[:22] + "..."
+				}
+
+				amount := entry.Amount
+				if len(amount) > 12 {
+					amount = amount[:9] + "..."
+				}
+
+				entryType := entry.Type
+				if len(entryType) > 12 {
+					entryType = entryType[:9] + "..."
+				}
+
+				invoiceUUID := "N/A"
+				if entry.InvoiceUUID != nil && *entry.InvoiceUUID != "" {
+					uuid := *entry.InvoiceUUID
+					if len(uuid) > 18 {
+						uuid = uuid[:15] + "..."
+					}
+					invoiceUUID = uuid
+				}
+
+				rows = append(rows, table.Row{
+					dateStr,
+					description,
+					amount,
+					entryType,
+					invoiceUUID,
+				})
+			}
 		}
-		
-		period := inv.InvoicePeriod
-		if len(period) > 15 {
-			period = period[:12] + "..."
+	} else {
+		// Invoices view (default)
+		columns = []table.Column{
+			{Title: "INVOICE UUID", Width: max(int(float64(availableWidth)*0.35), 20)},
+			{Title: "AMOUNT", Width: max(int(float64(availableWidth)*0.15), 12)},
+			{Title: "INVOICE PERIOD", Width: max(int(float64(availableWidth)*0.25), 15)},
+			{Title: "DATE", Width: max(int(float64(availableWidth)*0.25), 15)},
 		}
-		
-		date := "N/A"
-		if !inv.UpdatedAt.IsZero() {
-			date = inv.UpdatedAt.Format("2006-01-02")
+		m.table.SetColumns(columns)
+
+		for _, inv := range m.billingInvoices {
+			amount := inv.Amount
+			if len(amount) > 12 {
+				amount = amount[:9] + "..."
+			}
+
+			period := inv.InvoicePeriod
+			if len(period) > 15 {
+				period = period[:12] + "..."
+			}
+
+			date := "N/A"
+			if !inv.UpdatedAt.IsZero() {
+				date = inv.UpdatedAt.Format("2006-01-02")
+			}
+
+			uuid := inv.InvoiceUUID
+			if len(uuid) > 20 {
+				uuid = uuid[:17] + "..."
+			}
+
+			rows = append(rows, table.Row{
+				uuid,
+				amount,
+				period,
+				date,
+			})
 		}
-		
-		uuid := inv.InvoiceUUID
-		if len(uuid) > 20 {
-			uuid = uuid[:17] + "..."
-		}
-		
-		rows = append(rows, table.Row{
-			uuid,
-			amount,
-			period,
-			date,
-		})
 	}
 
 	if len(rows) == 0 {
@@ -1419,7 +1782,7 @@ func (m *model) updateBillingTable() {
 		rows = []table.Row{placeholderRow}
 	}
 
-	m.table.SetColumns(columns)
+	// Now set the rows with the correct column structure
 	m.table.SetRows(rows)
 }
 
@@ -2092,6 +2455,10 @@ func (m model) View() string {
 		return m.renderCreateForm()
 	}
 
+	if m.viewingBillingDetails {
+		return m.renderBillingDetails()
+	}
+
 	if m.viewingDetails {
 		if m.selectedDroplet != nil {
 			return m.renderDropletDetails()
@@ -2442,33 +2809,47 @@ func (m model) renderTopBarK9sStyle() string {
 		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Kubernetes Clusters"))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Clusters: ") + valueStyle.Render(fmt.Sprintf("%d", m.clusterCount)))
-		} else if m.currentView == viewBilling {
-			leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Billing Dashboard"))
-			leftContent.WriteString("\n")
-			if m.billingBalance != nil {
-				monthToDate := m.billingBalance.MonthToDateBalance
-				if len(monthToDate) > leftWidth-18 {
-					monthToDate = truncateString(monthToDate, leftWidth-18)
+	} else if m.currentView == viewBilling {
+		modeDisplay := "Invoices"
+		if m.billingMode == "monthly" {
+			modeDisplay = "Monthly"
+			if m.selectedBillingMonth != "" {
+				// Format selected month for display
+				if t, err := time.Parse("2006-01", m.selectedBillingMonth); err == nil {
+					modeDisplay = t.Format("Jan 2006")
+				} else {
+					modeDisplay = m.selectedBillingMonth
 				}
-				leftContent.WriteString(labelStyle.Render("Month-to-Date: ") + valueStyle.Render(monthToDate))
-				leftContent.WriteString("\n")
-				accountBalance := m.billingBalance.AccountBalance
-				if len(accountBalance) > leftWidth-18 {
-					accountBalance = truncateString(accountBalance, leftWidth-18)
-				}
-				leftContent.WriteString(labelStyle.Render("Account Balance: ") + valueStyle.Render(accountBalance))
-				leftContent.WriteString("\n")
 			}
-			leftContent.WriteString(labelStyle.Render("Invoices: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.billingInvoices))))
+		}
+		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Billing - "+modeDisplay))
+		leftContent.WriteString("\n")
+		if m.billingBalance != nil {
+			monthToDate := m.billingBalance.MonthToDateBalance
+			if len(monthToDate) > leftWidth-18 {
+				monthToDate = truncateString(monthToDate, leftWidth-18)
+			}
+			leftContent.WriteString(labelStyle.Render("Month-to-Date: ") + valueStyle.Render(monthToDate))
 			leftContent.WriteString("\n")
+			accountBalance := m.billingBalance.AccountBalance
+			if len(accountBalance) > leftWidth-18 {
+				accountBalance = truncateString(accountBalance, leftWidth-18)
+			}
+			leftContent.WriteString(labelStyle.Render("Account Balance: ") + valueStyle.Render(accountBalance))
+			leftContent.WriteString("\n")
+		}
+		if m.billingMode == "invoices" {
+			leftContent.WriteString(labelStyle.Render("Invoices: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.billingInvoices))))
+		} else {
 			historyCount := 0
 			if m.billingHistory != nil && m.billingHistory.BillingHistory != nil {
 				historyCount = len(m.billingHistory.BillingHistory)
 			}
-			leftContent.WriteString(labelStyle.Render("History: ") + valueStyle.Render(fmt.Sprintf("%d", historyCount)))
-		} else {
-			// Truncate region if needed
-			region := truncateString(m.selectedRegion, leftWidth-9)
+			leftContent.WriteString(labelStyle.Render("History Entries: ") + valueStyle.Render(fmt.Sprintf("%d", historyCount)))
+		}
+	} else {
+		// Truncate region if needed
+		region := truncateString(m.selectedRegion, leftWidth-9)
 		leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(region))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Droplets: ") + valueStyle.Render(fmt.Sprintf("%d", m.dropletCount)))
@@ -2506,7 +2887,7 @@ func (m model) renderTopBarK9sStyle() string {
 	}
 	leftContent.WriteString(labelStyle.Render("Refresh: ") + valueStyle.Render(refreshTime))
 	leftContent.WriteString("\n")
-	leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.3.0"))
+	leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.4.0"))
 
 	// iTerm-optimized: Better padding for left panel
 	leftPanel := lipgloss.NewStyle().
@@ -2522,24 +2903,32 @@ func (m model) renderTopBarK9sStyle() string {
 
 	// iTerm-optimized: Simple format matching the desired output
 	// CRITICAL: Always show 1, 2, n first - simple format like "1 Droplets"
-		if m.currentView == viewBilling {
-			middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
-			middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
-			middleContent.WriteString(keyStyle.Render("3") + " Billing\n")
-			middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
-			middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
-			middleContent.WriteString(keyStyle.Render("q") + " Quit")
-		} else if m.currentView == viewClusterResources {
-			middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
-			middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
-			middleContent.WriteString(keyStyle.Render(":") + " Command\n")
-			middleContent.WriteString(keyStyle.Render("d") + " Next\n")
-			middleContent.WriteString(keyStyle.Render("n") + " Namespace\n")
-			middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
-			middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
-			middleContent.WriteString(keyStyle.Render("esc") + " Back\n")
-			middleContent.WriteString(keyStyle.Render("q") + " Quit")
-		} else if m.currentView == viewDroplets {
+	if m.currentView == viewBilling {
+		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		middleContent.WriteString(keyStyle.Render("3") + " Billing\n")
+		middleContent.WriteString(keyStyle.Render("m") + " Monthly\n")
+		middleContent.WriteString(keyStyle.Render("i") + " Invoices\n")
+		middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		if m.billingMode == "monthly" {
+			if m.selectedBillingMonth == "" {
+				middleContent.WriteString(keyStyle.Render("enter") + " Month Details\n")
+			} else {
+				middleContent.WriteString(keyStyle.Render("esc") + " Back\n")
+			}
+		}
+		middleContent.WriteString(keyStyle.Render("q") + " Quit")
+	} else if m.currentView == viewClusterResources {
+		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		middleContent.WriteString(keyStyle.Render(":") + " Command\n")
+		middleContent.WriteString(keyStyle.Render("d") + " Next\n")
+		middleContent.WriteString(keyStyle.Render("n") + " Namespace\n")
+		middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
+		middleContent.WriteString(keyStyle.Render("esc") + " Back\n")
+		middleContent.WriteString(keyStyle.Render("q") + " Quit")
+	} else if m.currentView == viewDroplets {
 		// Droplets view - show 1, 2, n prominently (matching image format)
 		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
 		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
@@ -2550,23 +2939,23 @@ func (m model) renderTopBarK9sStyle() string {
 		middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
 		middleContent.WriteString(keyStyle.Render("?") + " Help\n")
 		middleContent.WriteString(keyStyle.Render("q") + " Quit")
-		} else if m.currentView == viewClusters {
-			// Clusters view
-			middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
-			middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
-			middleContent.WriteString(keyStyle.Render("3") + " Billing\n")
-			middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
-			middleContent.WriteString(keyStyle.Render("enter") + " Enter\n")
-			middleContent.WriteString(keyStyle.Render("?") + " Help\n")
-			middleContent.WriteString(keyStyle.Render("q") + " Quit")
-		} else {
-			// Billing view (fallback)
-			middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
-			middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
-			middleContent.WriteString(keyStyle.Render("3") + " Billing\n")
-			middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
-			middleContent.WriteString(keyStyle.Render("q") + " Quit")
-		}
+	} else if m.currentView == viewClusters {
+		// Clusters view
+		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		middleContent.WriteString(keyStyle.Render("3") + " Billing\n")
+		middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		middleContent.WriteString(keyStyle.Render("enter") + " Enter\n")
+		middleContent.WriteString(keyStyle.Render("?") + " Help\n")
+		middleContent.WriteString(keyStyle.Render("q") + " Quit")
+	} else {
+		// Billing view (fallback)
+		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		middleContent.WriteString(keyStyle.Render("3") + " Billing\n")
+		middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		middleContent.WriteString(keyStyle.Render("q") + " Quit")
+	}
 
 	// iTerm-friendly padding and rendering
 	middlePanel := lipgloss.NewStyle().
@@ -2661,7 +3050,19 @@ func (m model) renderTopBarTwoPanelK9s() string {
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Clusters: ") + valueStyle.Render(fmt.Sprintf("%d", m.clusterCount)))
 	} else if m.currentView == viewBilling {
-		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Billing Dashboard"))
+		modeDisplay := "Invoices"
+		if m.billingMode == "monthly" {
+			modeDisplay = "Monthly"
+			if m.selectedBillingMonth != "" {
+				// Format selected month for display
+				if t, err := time.Parse("2006-01", m.selectedBillingMonth); err == nil {
+					modeDisplay = t.Format("Jan 2006")
+				} else {
+					modeDisplay = m.selectedBillingMonth
+				}
+			}
+		}
+		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Billing - "+modeDisplay))
 		leftContent.WriteString("\n")
 		if m.billingBalance != nil {
 			monthToDate := m.billingBalance.MonthToDateBalance
@@ -2677,13 +3078,15 @@ func (m model) renderTopBarTwoPanelK9s() string {
 			leftContent.WriteString(labelStyle.Render("Account Balance: ") + valueStyle.Render(accountBalance))
 			leftContent.WriteString("\n")
 		}
-		leftContent.WriteString(labelStyle.Render("Invoices: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.billingInvoices))))
-		leftContent.WriteString("\n")
+		if m.billingMode == "invoices" {
+			leftContent.WriteString(labelStyle.Render("Invoices: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.billingInvoices))))
+		} else {
 			historyCount := 0
 			if m.billingHistory != nil && m.billingHistory.BillingHistory != nil {
 				historyCount = len(m.billingHistory.BillingHistory)
 			}
-			leftContent.WriteString(labelStyle.Render("History: ") + valueStyle.Render(fmt.Sprintf("%d", historyCount)))
+			leftContent.WriteString(labelStyle.Render("History Entries: ") + valueStyle.Render(fmt.Sprintf("%d", historyCount)))
+		}
 	} else {
 		leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedRegion))
 		leftContent.WriteString("\n")
@@ -2738,15 +3141,16 @@ func (m model) renderTopBarTwoPanelK9s() string {
 		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
 		rightContent.WriteString(keyStyle.Render("2") + " Clusters\n")
 		rightContent.WriteString(keyStyle.Render("3") + " Billing\n")
+		rightContent.WriteString(keyStyle.Render("m") + " Monthly\n")
+		rightContent.WriteString(keyStyle.Render("i") + " Invoices\n")
 		rightContent.WriteString(keyStyle.Render("r") + " Refresh\n")
-		rightContent.WriteString(keyStyle.Render("enter") + " Details\n")
-		rightContent.WriteString(keyStyle.Render("q") + " Quit")
-	} else if m.currentView == viewBilling {
-		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
-		rightContent.WriteString(keyStyle.Render("2") + " Clusters\n")
-		rightContent.WriteString(keyStyle.Render("3") + " Billing\n")
-		rightContent.WriteString(keyStyle.Render("r") + " Refresh\n")
-		rightContent.WriteString(keyStyle.Render("enter") + " Details\n")
+		if m.billingMode == "monthly" {
+			if m.selectedBillingMonth == "" {
+				rightContent.WriteString(keyStyle.Render("enter") + " Month Details\n")
+			} else {
+				rightContent.WriteString(keyStyle.Render("esc") + " Back\n")
+			}
+		}
 		rightContent.WriteString(keyStyle.Render("q") + " Quit")
 	} else {
 		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
@@ -2789,7 +3193,13 @@ func (m model) renderTopBarCompactK9s() string {
 	} else if m.currentView == viewClusters {
 		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<3>") + " Billing | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<enter>") + " Enter | " + keyStyle.Render("<q>") + " Quit"
 	} else if m.currentView == viewBilling {
-		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<3>") + " Billing | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<q>") + " Quit"
+		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<3>") + " Billing | " + keyStyle.Render("<m>") + " Monthly | " + keyStyle.Render("<i>") + " Invoices | " + keyStyle.Render("<r>") + " Refresh"
+		if m.billingMode == "monthly" && m.selectedBillingMonth != "" {
+			keybindings += " | " + keyStyle.Render("<esc>") + " Back"
+		} else if m.billingMode == "monthly" {
+			keybindings += " | " + keyStyle.Render("<enter>") + " Details"
+		}
+		keybindings += " | " + keyStyle.Render("<q>") + " Quit"
 	} else {
 		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<:>") + " Command | " + keyStyle.Render("<d>") + " Next | " + keyStyle.Render("<n>") + " Namespace | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<esc>") + " Back | " + keyStyle.Render("<q>") + " Quit"
 	}
@@ -2841,13 +3251,13 @@ func (m model) renderTopBarThreePanel() string {
 		accountInfo.WriteString("\n")
 	}
 
-	accountInfo.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.2.0"))
+	accountInfo.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.4.0"))
 
 	// Render the left panel - ensure it's always visible with summary
 	leftPanelContent := accountInfo.String()
 	// CRITICAL: Ensure content is not empty
 	if strings.TrimSpace(leftPanelContent) == "" {
-		leftPanelContent = fmt.Sprintf("DigitalOcean\n\nDroplets: %d\nRegion: %s\nRefresh: N/A\nVersion: dogoctl v1.2.0",
+		leftPanelContent = fmt.Sprintf("DigitalOcean\n\nDroplets: %d\nRegion: %s\nRefresh: N/A\nVersion: dogoctl v1.4.0",
 			m.dropletCount, m.selectedRegion)
 	}
 	// Render with proper width - ensure content is visible
@@ -2952,7 +3362,7 @@ func (m model) renderStatusBar() string {
 			historyCount = len(m.billingHistory.BillingHistory)
 		}
 		if m.billingBalance != nil {
-			statusText = fmt.Sprintf("%s | Balance: %s | MTD: %s | Invoices: %d", 
+			statusText = fmt.Sprintf("%s | Balance: %s | MTD: %s | Invoices: %d",
 				statusText, m.billingBalance.AccountBalance, m.billingBalance.MonthToDateBalance, len(m.billingInvoices))
 		} else {
 			statusText = fmt.Sprintf("%s | Invoices: %d | History: %d", statusText, len(m.billingInvoices), historyCount)
@@ -3490,6 +3900,272 @@ func (m model) renderClusterDetails() string {
 	return s.String()
 }
 
+func (m model) renderBillingDetails() string {
+	var s strings.Builder
+	labelStyle := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Width(20)
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
+
+	// Dynamic box width based on terminal size
+	boxWidth := min(m.width-4, 90)
+	if boxWidth < 50 {
+		boxWidth = 50
+	}
+	if boxWidth > m.width-4 {
+		boxWidth = m.width - 4
+	}
+
+	// Calculate available height for content (terminal height minus header and help text)
+	availableHeight := m.height - 6 // Reserve space for header, padding, and help text
+	if availableHeight < 5 {
+		availableHeight = 5
+	}
+
+	if m.detailedInvoice != nil && m.selectedInvoice != nil {
+		// Render full invoice details (like doctl invoice get)
+		inv := m.detailedInvoice
+		invMeta := m.selectedInvoice
+		headerText := fmt.Sprintf("💰 Invoice Details")
+
+		headerBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Padding(1, 2).
+			Width(boxWidth).
+			Render(headerText)
+
+		s.WriteString(headerBox)
+		s.WriteString("\n\n")
+
+		var details strings.Builder
+		details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Invoice UUID:"), valueStyle.Render(invMeta.InvoiceUUID)))
+		details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Amount:"), valueStyle.Render(invMeta.Amount)))
+		if invMeta.InvoicePeriod != "" {
+			details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Invoice Period:"), valueStyle.Render(invMeta.InvoicePeriod)))
+		}
+		if !invMeta.UpdatedAt.IsZero() {
+			details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Updated At:"), valueStyle.Render(invMeta.UpdatedAt.Format("2006-01-02 15:04:05"))))
+		}
+
+		// Invoice Items
+		if len(inv.InvoiceItems) > 0 {
+			details.WriteString("\n")
+			details.WriteString(labelStyle.Render("Invoice Items:"))
+			details.WriteString("\n")
+			totalAmount := 0.0
+			for i, item := range inv.InvoiceItems {
+				details.WriteString(fmt.Sprintf("  %d. %s\n", i+1, valueStyle.Render(item.Product)))
+				if item.GroupDescription != "" {
+					details.WriteString(fmt.Sprintf("     %s: %s\n", labelStyle.Render("Group"), valueStyle.Render(item.GroupDescription)))
+				}
+				if item.Description != "" {
+					descLines := strings.Split(item.Description, "\n")
+					for _, line := range descLines {
+						if strings.TrimSpace(line) != "" {
+							details.WriteString(fmt.Sprintf("     %s\n", valueStyle.Render("  "+line)))
+						}
+					}
+				}
+				if item.ResourceUUID != "" {
+					details.WriteString(fmt.Sprintf("     %s: %s\n", labelStyle.Render("Resource UUID"), valueStyle.Render(item.ResourceUUID)))
+				}
+				if item.ResourceID != "" {
+					details.WriteString(fmt.Sprintf("     %s: %s\n", labelStyle.Render("Resource ID"), valueStyle.Render(item.ResourceID)))
+				}
+				details.WriteString(fmt.Sprintf("     %s: %s\n", labelStyle.Render("Amount"), valueStyle.Render(item.Amount)))
+				if item.Duration != "" {
+					details.WriteString(fmt.Sprintf("     %s: %s %s\n", labelStyle.Render("Duration"), valueStyle.Render(item.Duration), valueStyle.Render(item.DurationUnit)))
+				}
+				if !item.StartTime.IsZero() && !item.EndTime.IsZero() {
+					details.WriteString(fmt.Sprintf("     %s: %s to %s\n", labelStyle.Render("Period"),
+						valueStyle.Render(item.StartTime.Format("2006-01-02 15:04")),
+						valueStyle.Render(item.EndTime.Format("2006-01-02 15:04"))))
+				}
+				if item.Category != "" {
+					details.WriteString(fmt.Sprintf("     %s: %s\n", labelStyle.Render("Category"), valueStyle.Render(item.Category)))
+				}
+				if item.ProjectName != "" {
+					details.WriteString(fmt.Sprintf("     %s: %s\n", labelStyle.Render("Project"), valueStyle.Render(item.ProjectName)))
+				}
+				// Calculate total
+				amountVal := parseAmount(item.Amount)
+				totalAmount += amountVal
+				if i < len(inv.InvoiceItems)-1 {
+					details.WriteString("\n")
+				}
+			}
+			details.WriteString("\n")
+			details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Total Items:"), valueStyle.Render(fmt.Sprintf("%d", len(inv.InvoiceItems)))))
+			details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Calculated Total:"), valueStyle.Render(formatAmount(totalAmount))))
+		}
+
+		// Convert details to lines for scrolling
+		allLines := strings.Split(details.String(), "\n")
+		totalLines := len(allLines)
+
+		// Limit scroll position
+		maxScroll := max(0, totalLines-availableHeight)
+		if m.billingDetailsScroll > maxScroll {
+			m.billingDetailsScroll = maxScroll
+		}
+		if m.billingDetailsScroll < 0 {
+			m.billingDetailsScroll = 0
+		}
+
+		// Get visible lines
+		startLine := m.billingDetailsScroll
+		endLine := min(startLine+availableHeight, totalLines)
+		visibleLines := allLines[startLine:endLine]
+		visibleContent := strings.Join(visibleLines, "\n")
+
+		detailsBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Padding(1, 2).
+			Width(boxWidth).
+			Height(availableHeight + 2) // Add padding
+
+		s.WriteString(detailsBox.Render(visibleContent))
+		s.WriteString("\n\n")
+
+		// Scroll indicator
+		scrollInfo := ""
+		if totalLines > availableHeight {
+			scrollInfo = fmt.Sprintf(" [%d/%d lines]", m.billingDetailsScroll+1, totalLines)
+		}
+		helpText := helpStyle.Render(fmt.Sprintf("[↑↓/j/k] Scroll  [g/G] Top/Bottom  [esc/enter] Back  [q] Quit%s", scrollInfo))
+		s.WriteString(helpText)
+		s.WriteString("\n")
+
+	} else if m.selectedInvoice != nil {
+		// Fallback: Render basic invoice details if detailed invoice not loaded yet
+		inv := m.selectedInvoice
+		headerText := fmt.Sprintf("💰 Invoice Details")
+
+		headerBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Padding(1, 2).
+			Width(boxWidth).
+			Render(headerText)
+
+		s.WriteString(headerBox)
+		s.WriteString("\n\n")
+
+		var details strings.Builder
+		details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Invoice UUID:"), valueStyle.Render(inv.InvoiceUUID)))
+		details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Amount:"), valueStyle.Render(inv.Amount)))
+		details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Invoice Period:"), valueStyle.Render(inv.InvoicePeriod)))
+		if !inv.UpdatedAt.IsZero() {
+			details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Updated At:"), valueStyle.Render(inv.UpdatedAt.Format("2006-01-02 15:04:05"))))
+		}
+
+		// Convert details to lines for scrolling
+		allLines := strings.Split(details.String(), "\n")
+		totalLines := len(allLines)
+
+		// Limit scroll position
+		maxScroll := max(0, totalLines-availableHeight)
+		if m.billingDetailsScroll > maxScroll {
+			m.billingDetailsScroll = maxScroll
+		}
+		if m.billingDetailsScroll < 0 {
+			m.billingDetailsScroll = 0
+		}
+
+		// Get visible lines
+		startLine := m.billingDetailsScroll
+		endLine := min(startLine+availableHeight, totalLines)
+		visibleLines := allLines[startLine:endLine]
+		visibleContent := strings.Join(visibleLines, "\n")
+
+		detailsBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Padding(1, 2).
+			Width(boxWidth).
+			Height(availableHeight + 2) // Add padding
+
+		s.WriteString(detailsBox.Render(visibleContent))
+		s.WriteString("\n\n")
+
+		// Scroll indicator
+		scrollInfo := ""
+		if totalLines > availableHeight {
+			scrollInfo = fmt.Sprintf(" [%d/%d lines]", m.billingDetailsScroll+1, totalLines)
+		}
+		helpText := helpStyle.Render(fmt.Sprintf("[↑↓/j/k] Scroll  [g/G] Top/Bottom  [esc/enter] Back  [q] Quit%s", scrollInfo))
+		s.WriteString(helpText)
+		s.WriteString("\n")
+
+	} else if m.selectedBillingEntry != nil {
+		// Render billing entry details
+		entry := m.selectedBillingEntry
+		headerText := fmt.Sprintf("📊 Billing Entry Details")
+
+		headerBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Padding(1, 2).
+			Width(boxWidth).
+			Render(headerText)
+
+		s.WriteString(headerBox)
+		s.WriteString("\n\n")
+
+		var details strings.Builder
+		details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Date:"), valueStyle.Render(entry.Date.Format("2006-01-02 15:04:05"))))
+		details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Description:"), valueStyle.Render(entry.Description)))
+		details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Amount:"), valueStyle.Render(entry.Amount)))
+		details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Type:"), valueStyle.Render(entry.Type)))
+		if entry.InvoiceUUID != nil && *entry.InvoiceUUID != "" {
+			details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Invoice UUID:"), valueStyle.Render(*entry.InvoiceUUID)))
+		}
+		if entry.InvoiceID != nil && *entry.InvoiceID != "" {
+			details.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Invoice ID:"), valueStyle.Render(*entry.InvoiceID)))
+		}
+
+		// Convert details to lines for scrolling
+		allLines := strings.Split(details.String(), "\n")
+		totalLines := len(allLines)
+
+		// Limit scroll position
+		maxScroll := max(0, totalLines-availableHeight)
+		if m.billingDetailsScroll > maxScroll {
+			m.billingDetailsScroll = maxScroll
+		}
+		if m.billingDetailsScroll < 0 {
+			m.billingDetailsScroll = 0
+		}
+
+		// Get visible lines
+		startLine := m.billingDetailsScroll
+		endLine := min(startLine+availableHeight, totalLines)
+		visibleLines := allLines[startLine:endLine]
+		visibleContent := strings.Join(visibleLines, "\n")
+
+		detailsBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Padding(1, 2).
+			Width(boxWidth).
+			Height(availableHeight + 2) // Add padding
+
+		s.WriteString(detailsBox.Render(visibleContent))
+		s.WriteString("\n\n")
+
+		// Scroll indicator
+		scrollInfo := ""
+		if totalLines > availableHeight {
+			scrollInfo = fmt.Sprintf(" [%d/%d lines]", m.billingDetailsScroll+1, totalLines)
+		}
+		helpText := helpStyle.Render(fmt.Sprintf("[↑↓/j/k] Scroll  [g/G] Top/Bottom  [esc/enter] Back  [q] Quit%s", scrollInfo))
+		s.WriteString(helpText)
+		s.WriteString("\n")
+	}
+
+	return s.String()
+}
+
 func loadDroplets(client *godo.Client) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
@@ -3873,20 +4549,39 @@ func loadBalance(client *godo.Client) tea.Cmd {
 func loadInvoices(client *godo.Client) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
-		opt := &godo.ListOptions{PerPage: 50}
-		invoiceList, _, err := client.Invoices.List(ctx, opt)
-		if err != nil {
-			return errMsg(err)
-		}
-		// InvoiceList contains Invoices ([]InvoiceListItem) and InvoicePreview
+		opt := &godo.ListOptions{Page: 1, PerPage: 50}
 		var allInvoices []godo.InvoiceListItem
-		if invoiceList != nil {
-			allInvoices = invoiceList.Invoices
-			// Also include the preview if available
-			if invoiceList.InvoicePreview.InvoiceUUID != "" {
-				allInvoices = append([]godo.InvoiceListItem{invoiceList.InvoicePreview}, allInvoices...)
+
+		// Handle pagination to get all invoices
+		for {
+			invoiceList, resp, err := client.Invoices.List(ctx, opt)
+			if err != nil {
+				return errMsg(err)
 			}
+
+			if invoiceList != nil {
+				// Add invoices from current page
+				allInvoices = append(allInvoices, invoiceList.Invoices...)
+
+				// Also include the preview if available (only on first page)
+				if opt.Page == 1 && invoiceList.InvoicePreview.InvoiceUUID != "" {
+					allInvoices = append([]godo.InvoiceListItem{invoiceList.InvoicePreview}, allInvoices...)
+				}
+			}
+
+			// Check if there are more pages
+			if resp == nil || resp.Links == nil || resp.Links.IsLastPage() {
+				break
+			}
+
+			// Get next page
+			page, err := resp.Links.CurrentPage()
+			if err != nil {
+				break
+			}
+			opt.Page = page + 1
 		}
+
 		return invoicesLoadedMsg(allInvoices)
 	}
 }
@@ -3900,6 +4595,18 @@ func loadBillingHistory(client *godo.Client) tea.Cmd {
 			return errMsg(err)
 		}
 		return billingHistoryLoadedMsg(history)
+	}
+}
+
+func loadInvoiceDetails(client *godo.Client, invoiceUUID string) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		opt := &godo.ListOptions{PerPage: 100}
+		invoice, _, err := client.Invoices.Get(ctx, invoiceUUID, opt)
+		if err != nil {
+			return errMsg(err)
+		}
+		return invoiceDetailsLoadedMsg(invoice)
 	}
 }
 

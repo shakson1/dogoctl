@@ -4,7 +4,7 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets an
 
 ![dogoctl](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Version](https://img.shields.io/badge/version-1.3.0-blue)
+![Version](https://img.shields.io/badge/version-1.4.0-blue)
 
 ## ✨ Features
 
@@ -33,7 +33,10 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets an
 ### Billing Dashboard
 - 💰 **Account Balance**: View current account balance and month-to-date usage
 - 📄 **Invoice List**: Browse all invoices with UUID, amount, period, and date
-- 📊 **Billing History**: View billing history entries
+- 📊 **Monthly Billing View**: View billing history organized by month with totals
+- 🔍 **Detailed Invoice Information**: Full invoice details with all line items (like `doctl invoice get`)
+- 📋 **Billing Entry Details**: Detailed information for individual billing entries
+- 📜 **Scrolling Support**: Scroll through long invoice details with arrow keys or vim-style navigation
 - 🔄 **Real-time Refresh**: Reload billing data with loading indicators
 - 📱 **Responsive Layout**: Adapts to terminal window size dynamically
 
@@ -141,8 +144,13 @@ do-droplets
 | `<1>` | Switch to Droplets view |
 | `<2>` | Switch to Kubernetes Clusters view |
 | `<3>` | Switch to Billing Dashboard |
+| `m` | Switch to monthly billing view |
+| `i` | Switch to invoices view |
 | `r` | Refresh billing data |
-| `<enter>` | View invoice details (if available) |
+| `<enter>` | View invoice/month details or drill into month entries |
+| `↑/↓` or `j/k` | Scroll in detailed views |
+| `g` / `G` | Jump to top/bottom in detailed views |
+| `<esc>` | Go back from month details or detailed view |
 | `q` | Quit |
 
 ### Cluster Resources View
@@ -185,6 +193,9 @@ Press `<esc>` to cancel command mode.
 | Key | Action |
 |-----|--------|
 | `esc` / `enter` / `backspace` | Return to list |
+| `↑/↓` or `j/k` | Scroll up/down (in billing details) |
+| `PageUp` / `PageDown` or `Ctrl+B` / `Ctrl+F` | Page up/down (in billing details) |
+| `g` / `G` | Jump to top/bottom (in billing details) |
 | `q` | Quit |
 
 ### Delete Confirmation
@@ -407,19 +418,60 @@ For issues, questions, or contributions, please open an issue on GitHub.
 
 ## 💰 Billing Dashboard
 
-The billing dashboard provides an overview of your DigitalOcean account's billing information:
+The billing dashboard provides comprehensive billing information for your DigitalOcean account:
 
+### Invoices View
 1. Press `<3>` to switch to the Billing Dashboard
-2. View your account balance and month-to-date usage in the top panel
-3. Browse invoices in the table showing:
+2. Press `i` to switch to invoices view (default)
+3. View your account balance and month-to-date usage in the top panel
+4. Browse invoices in the table showing:
    - Invoice UUID
    - Amount
    - Invoice Period
    - Date
-4. Press `r` to refresh billing data
-5. Press `<1>`, `<2>`, or `<3>` to switch between views
+5. Press `<enter>` on an invoice to view full details with all line items
+6. In detailed invoice view, you can see:
+   - Complete invoice metadata
+   - All invoice items with descriptions, amounts, durations, and resource information
+   - Scroll through long invoices using `↑/↓`, `j/k`, or page keys
+
+### Monthly Billing View
+1. Press `m` to switch to monthly billing view
+2. See all months with:
+   - Month name (e.g., "Jan 2024")
+   - Total amount for that month
+   - Number of entries
+   - Last entry date
+3. Press `<enter>` on a month to see all billing entries for that month
+4. Monthly details show:
+   - Date, Description, Amount, Type, and Invoice UUID for each entry
+5. Press `<enter>` on a billing entry to see full details
+6. Press `<esc>` to go back to monthly summary
+
+### Scrolling in Detailed Views
+When viewing detailed invoice or billing entry information:
+- Use `↑/↓` arrow keys or `j/k` to scroll line by line
+- Use `PageUp`/`PageDown` or `Ctrl+B`/`Ctrl+F` to scroll by page
+- Use `g` to jump to top, `G` to jump to bottom
+- Scroll indicator shows your position (e.g., `[5/50 lines]`)
+
+### Navigation
+- Press `r` to refresh billing data
+- Press `<1>`, `<2>`, or `<3>` to switch between main views
+- Press `m` to switch to monthly view, `i` to switch to invoices view
 
 ## 📋 Changelog
+
+### v1.4.0 (2024)
+- **Enhanced Billing Dashboard**:
+  - **Monthly Billing View**: View billing history organized by month with totals and entry counts
+  - **Detailed Invoice Information**: Full invoice details with all line items, matching `doctl invoice get` output
+  - **Billing Entry Details**: Detailed view for individual billing history entries
+  - **Scrolling Support**: Scroll through long invoice details with arrow keys (`↑/↓`), vim-style (`j/k`), page keys, or jump to top/bottom (`g`/`G`)
+  - **Enhanced Navigation**: Switch between invoices and monthly views with `i` and `m` keys
+  - **Scroll Indicators**: Shows current position when content exceeds visible area
+- Improved invoice loading with pagination support
+- Better error handling for billing API calls
 
 ### v1.3.0 (2024)
 - **Billing Dashboard**: 
