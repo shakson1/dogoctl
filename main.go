@@ -2633,7 +2633,7 @@ func (m model) renderTopBarThreePanel() string {
 		accountInfo.WriteString("\n")
 	}
 
-	accountInfo.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.0"))
+	accountInfo.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.2.0"))
 
 	// Render the left panel - ensure it's always visible with summary
 	leftPanelContent := accountInfo.String()
