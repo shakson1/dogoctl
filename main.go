@@ -80,6 +80,10 @@ type model struct {
 	selectedSizeSlug   string      // Selected size slug for creation
 	selectedImageSlug  string      // Selected image slug for creation
 	selectionTable     table.Model // Table for selecting region/size/image
+	// Billing dashboard state
+	billingBalance     *godo.Balance
+	billingInvoices    []godo.InvoiceListItem
+	billingHistory     *godo.BillingHistory
 }
 
 type errMsg error
@@ -97,11 +101,15 @@ type accountInfoMsg struct {
 type regionsLoadedMsg []godo.Region
 type sizesLoadedMsg []godo.Size
 type imagesLoadedMsg []godo.Image
+type balanceLoadedMsg *godo.Balance
+type invoicesLoadedMsg []godo.InvoiceListItem
+type billingHistoryLoadedMsg *godo.BillingHistory
 
 const (
 	viewDroplets         = "droplets"
 	viewClusters         = "clusters"
 	viewClusterResources = "cluster-resources"
+	viewBilling          = "billing"
 )
 
 var (
@@ -291,6 +299,9 @@ func initialModel(client *godo.Client) model {
 			selTable.SetStyles(selStyles)
 			return selTable
 		}(),
+		billingBalance:     nil,
+		billingInvoices:    []godo.InvoiceListItem{},
+		billingHistory:     nil,
 	}
 }
 
@@ -413,6 +424,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Update table immediately with cluster columns
 			m.updateTableRows()
 			return m, tea.Batch(loadClusters(m.client), m.spinner.Tick)
+		case "3":
+			// Handle "3" based on current view
+			if m.currentView == viewDroplets {
+				// In droplets view, "3" is for region filter
+				idx := 3
+				if idx > 0 && idx <= len(m.regions) {
+					m.selectedRegion = m.regions[idx-1]
+					m.updateTableRows()
+				}
+				return m, nil
+			}
+			// In other views, "3" switches to billing dashboard
+			m.currentView = viewBilling
+			m.loading = true
+			m.updateTableRows()
+			return m, tea.Batch(
+				loadBalance(m.client),
+				loadInvoices(m.client),
+				loadBillingHistory(m.client),
+				m.spinner.Tick,
+			)
 		case "n", "N":
 			if m.currentView == viewClusterResources {
 				// Switch namespace - if viewing namespaces, select one; otherwise toggle all/specific
@@ -469,6 +501,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(loadDroplets(m.client), m.spinner.Tick)
 			} else if m.currentView == viewClusterResources {
 				return m, tea.Batch(loadClusterResources(m.client, m.selectedCluster, m.clusterResourceType, m.selectedNamespace), m.spinner.Tick)
+			} else if m.currentView == viewBilling {
+				return m, tea.Batch(
+					loadBalance(m.client),
+					loadInvoices(m.client),
+					loadBillingHistory(m.client),
+					m.spinner.Tick,
+				)
 			} else {
 				return m, tea.Batch(loadClusters(m.client), m.spinner.Tick)
 			}
@@ -602,7 +641,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateTableRows()
 			}
 			return m, nil
-		case "3", "4", "5", "6", "7", "8", "9":
+		case "4", "5", "6", "7", "8", "9":
 			if m.currentView == viewDroplets {
 				idx, _ := strconv.Atoi(msg.String())
 				if idx > 0 && idx <= len(m.regions) {
@@ -692,6 +731,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case imagesLoadedMsg:
 		m.availableImages = msg
+		return m, nil
+
+	case balanceLoadedMsg:
+		m.billingBalance = msg
+		m.loading = false
+		return m, nil
+
+	case invoicesLoadedMsg:
+		m.billingInvoices = msg
+		m.loading = false
+		return m, nil
+
+	case billingHistoryLoadedMsg:
+		m.billingHistory = msg
+		m.loading = false
 		return m, nil
 
 	case dropletCreatedMsg:
@@ -995,7 +1049,11 @@ func getIPByType(d godo.Droplet, ipType string) string {
 func (m *model) updateTableRows() {
 	var rows []table.Row
 
-	if m.currentView == viewClusterResources {
+	if m.currentView == viewBilling {
+		// Show billing dashboard
+		m.updateBillingTable()
+		return
+	} else if m.currentView == viewClusterResources {
 		// Show cluster resources (deployments, pods, etc.)
 		m.updateClusterResourceTable()
 		return
@@ -1302,6 +1360,66 @@ func (m *model) updateTableRows() {
 		}
 	}
 
+	m.table.SetRows(rows)
+}
+
+func (m *model) updateBillingTable() {
+	// Update table columns for billing
+	tableWidth := m.width - 2
+	if tableWidth < 50 {
+		tableWidth = 50
+	}
+	availableWidth := tableWidth - 6
+
+	// Determine which billing section to show (default to balance/invoices)
+	// We'll show invoices in the table, balance in the top panel
+	columns := []table.Column{
+		{Title: "INVOICE UUID", Width: max(int(float64(availableWidth)*0.35), 20)},
+		{Title: "AMOUNT", Width: max(int(float64(availableWidth)*0.15), 12)},
+		{Title: "INVOICE PERIOD", Width: max(int(float64(availableWidth)*0.25), 15)},
+		{Title: "DATE", Width: max(int(float64(availableWidth)*0.25), 15)},
+	}
+
+	var rows []table.Row
+	for _, inv := range m.billingInvoices {
+		// Invoice is actually InvoiceListItem with InvoiceUUID, Amount, InvoicePeriod, UpdatedAt
+		amount := inv.Amount
+		if len(amount) > 12 {
+			amount = amount[:9] + "..."
+		}
+		
+		period := inv.InvoicePeriod
+		if len(period) > 15 {
+			period = period[:12] + "..."
+		}
+		
+		date := "N/A"
+		if !inv.UpdatedAt.IsZero() {
+			date = inv.UpdatedAt.Format("2006-01-02")
+		}
+		
+		uuid := inv.InvoiceUUID
+		if len(uuid) > 20 {
+			uuid = uuid[:17] + "..."
+		}
+		
+		rows = append(rows, table.Row{
+			uuid,
+			amount,
+			period,
+			date,
+		})
+	}
+
+	if len(rows) == 0 {
+		placeholderRow := make(table.Row, len(columns))
+		for i := range placeholderRow {
+			placeholderRow[i] = "No data"
+		}
+		rows = []table.Row{placeholderRow}
+	}
+
+	m.table.SetColumns(columns)
 	m.table.SetRows(rows)
 }
 
@@ -2324,9 +2442,33 @@ func (m model) renderTopBarK9sStyle() string {
 		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Kubernetes Clusters"))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Clusters: ") + valueStyle.Render(fmt.Sprintf("%d", m.clusterCount)))
-	} else {
-		// Truncate region if needed
-		region := truncateString(m.selectedRegion, leftWidth-9)
+		} else if m.currentView == viewBilling {
+			leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Billing Dashboard"))
+			leftContent.WriteString("\n")
+			if m.billingBalance != nil {
+				monthToDate := m.billingBalance.MonthToDateBalance
+				if len(monthToDate) > leftWidth-18 {
+					monthToDate = truncateString(monthToDate, leftWidth-18)
+				}
+				leftContent.WriteString(labelStyle.Render("Month-to-Date: ") + valueStyle.Render(monthToDate))
+				leftContent.WriteString("\n")
+				accountBalance := m.billingBalance.AccountBalance
+				if len(accountBalance) > leftWidth-18 {
+					accountBalance = truncateString(accountBalance, leftWidth-18)
+				}
+				leftContent.WriteString(labelStyle.Render("Account Balance: ") + valueStyle.Render(accountBalance))
+				leftContent.WriteString("\n")
+			}
+			leftContent.WriteString(labelStyle.Render("Invoices: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.billingInvoices))))
+			leftContent.WriteString("\n")
+			historyCount := 0
+			if m.billingHistory != nil && m.billingHistory.BillingHistory != nil {
+				historyCount = len(m.billingHistory.BillingHistory)
+			}
+			leftContent.WriteString(labelStyle.Render("History: ") + valueStyle.Render(fmt.Sprintf("%d", historyCount)))
+		} else {
+			// Truncate region if needed
+			region := truncateString(m.selectedRegion, leftWidth-9)
 		leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(region))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Droplets: ") + valueStyle.Render(fmt.Sprintf("%d", m.dropletCount)))
@@ -2364,7 +2506,7 @@ func (m model) renderTopBarK9sStyle() string {
 	}
 	leftContent.WriteString(labelStyle.Render("Refresh: ") + valueStyle.Render(refreshTime))
 	leftContent.WriteString("\n")
-	leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.2.0"))
+	leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.3.0"))
 
 	// iTerm-optimized: Better padding for left panel
 	leftPanel := lipgloss.NewStyle().
@@ -2380,17 +2522,24 @@ func (m model) renderTopBarK9sStyle() string {
 
 	// iTerm-optimized: Simple format matching the desired output
 	// CRITICAL: Always show 1, 2, n first - simple format like "1 Droplets"
-	if m.currentView == viewClusterResources {
-		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
-		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
-		middleContent.WriteString(keyStyle.Render(":") + " Command\n")
-		middleContent.WriteString(keyStyle.Render("d") + " Next\n")
-		middleContent.WriteString(keyStyle.Render("n") + " Namespace\n")
-		middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
-		middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
-		middleContent.WriteString(keyStyle.Render("esc") + " Back\n")
-		middleContent.WriteString(keyStyle.Render("q") + " Quit")
-	} else if m.currentView == viewDroplets {
+		if m.currentView == viewBilling {
+			middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+			middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+			middleContent.WriteString(keyStyle.Render("3") + " Billing\n")
+			middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+			middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
+			middleContent.WriteString(keyStyle.Render("q") + " Quit")
+		} else if m.currentView == viewClusterResources {
+			middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+			middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+			middleContent.WriteString(keyStyle.Render(":") + " Command\n")
+			middleContent.WriteString(keyStyle.Render("d") + " Next\n")
+			middleContent.WriteString(keyStyle.Render("n") + " Namespace\n")
+			middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+			middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
+			middleContent.WriteString(keyStyle.Render("esc") + " Back\n")
+			middleContent.WriteString(keyStyle.Render("q") + " Quit")
+		} else if m.currentView == viewDroplets {
 		// Droplets view - show 1, 2, n prominently (matching image format)
 		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
 		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
@@ -2401,15 +2550,23 @@ func (m model) renderTopBarK9sStyle() string {
 		middleContent.WriteString(keyStyle.Render("enter") + " Details\n")
 		middleContent.WriteString(keyStyle.Render("?") + " Help\n")
 		middleContent.WriteString(keyStyle.Render("q") + " Quit")
-	} else {
-		// Clusters view
-		middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
-		middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
-		middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
-		middleContent.WriteString(keyStyle.Render("enter") + " Enter\n")
-		middleContent.WriteString(keyStyle.Render("?") + " Help\n")
-		middleContent.WriteString(keyStyle.Render("q") + " Quit")
-	}
+		} else if m.currentView == viewClusters {
+			// Clusters view
+			middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+			middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+			middleContent.WriteString(keyStyle.Render("3") + " Billing\n")
+			middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+			middleContent.WriteString(keyStyle.Render("enter") + " Enter\n")
+			middleContent.WriteString(keyStyle.Render("?") + " Help\n")
+			middleContent.WriteString(keyStyle.Render("q") + " Quit")
+		} else {
+			// Billing view (fallback)
+			middleContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+			middleContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+			middleContent.WriteString(keyStyle.Render("3") + " Billing\n")
+			middleContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+			middleContent.WriteString(keyStyle.Render("q") + " Quit")
+		}
 
 	// iTerm-friendly padding and rendering
 	middlePanel := lipgloss.NewStyle().
@@ -2503,6 +2660,30 @@ func (m model) renderTopBarTwoPanelK9s() string {
 		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Kubernetes Clusters"))
 		leftContent.WriteString("\n")
 		leftContent.WriteString(labelStyle.Render("Clusters: ") + valueStyle.Render(fmt.Sprintf("%d", m.clusterCount)))
+	} else if m.currentView == viewBilling {
+		leftContent.WriteString(labelStyle.Render("View: ") + valueStyle.Render("Billing Dashboard"))
+		leftContent.WriteString("\n")
+		if m.billingBalance != nil {
+			monthToDate := m.billingBalance.MonthToDateBalance
+			if len(monthToDate) > leftPanelWidth-18 {
+				monthToDate = truncateString(monthToDate, leftPanelWidth-18)
+			}
+			leftContent.WriteString(labelStyle.Render("Month-to-Date: ") + valueStyle.Render(monthToDate))
+			leftContent.WriteString("\n")
+			accountBalance := m.billingBalance.AccountBalance
+			if len(accountBalance) > leftPanelWidth-18 {
+				accountBalance = truncateString(accountBalance, leftPanelWidth-18)
+			}
+			leftContent.WriteString(labelStyle.Render("Account Balance: ") + valueStyle.Render(accountBalance))
+			leftContent.WriteString("\n")
+		}
+		leftContent.WriteString(labelStyle.Render("Invoices: ") + valueStyle.Render(fmt.Sprintf("%d", len(m.billingInvoices))))
+		leftContent.WriteString("\n")
+			historyCount := 0
+			if m.billingHistory != nil && m.billingHistory.BillingHistory != nil {
+				historyCount = len(m.billingHistory.BillingHistory)
+			}
+			leftContent.WriteString(labelStyle.Render("History: ") + valueStyle.Render(fmt.Sprintf("%d", historyCount)))
 	} else {
 		leftContent.WriteString(labelStyle.Render("Region: ") + valueStyle.Render(m.selectedRegion))
 		leftContent.WriteString("\n")
@@ -2549,8 +2730,23 @@ func (m model) renderTopBarTwoPanelK9s() string {
 	} else if m.currentView == viewClusters {
 		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
 		rightContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		rightContent.WriteString(keyStyle.Render("3") + " Billing\n")
 		rightContent.WriteString(keyStyle.Render("r") + " Refresh\n")
 		rightContent.WriteString(keyStyle.Render("enter") + " Enter\n")
+		rightContent.WriteString(keyStyle.Render("q") + " Quit")
+	} else if m.currentView == viewBilling {
+		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		rightContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		rightContent.WriteString(keyStyle.Render("3") + " Billing\n")
+		rightContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		rightContent.WriteString(keyStyle.Render("enter") + " Details\n")
+		rightContent.WriteString(keyStyle.Render("q") + " Quit")
+	} else if m.currentView == viewBilling {
+		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
+		rightContent.WriteString(keyStyle.Render("2") + " Clusters\n")
+		rightContent.WriteString(keyStyle.Render("3") + " Billing\n")
+		rightContent.WriteString(keyStyle.Render("r") + " Refresh\n")
+		rightContent.WriteString(keyStyle.Render("enter") + " Details\n")
 		rightContent.WriteString(keyStyle.Render("q") + " Quit")
 	} else {
 		rightContent.WriteString(keyStyle.Render("1") + " Droplets\n")
@@ -2589,9 +2785,11 @@ func (m model) renderTopBarCompactK9s() string {
 	s.WriteString("\n")
 	var keybindings string
 	if m.currentView == "droplets" {
-		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<n>") + " New | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<d>") + " Delete | " + keyStyle.Render("<s>") + " SSH | " + keyStyle.Render("<q>") + " Quit"
+		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<3>") + " Billing | " + keyStyle.Render("<n>") + " New | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<d>") + " Delete | " + keyStyle.Render("<s>") + " SSH | " + keyStyle.Render("<q>") + " Quit"
 	} else if m.currentView == viewClusters {
-		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<enter>") + " Enter | " + keyStyle.Render("<q>") + " Quit"
+		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<3>") + " Billing | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<enter>") + " Enter | " + keyStyle.Render("<q>") + " Quit"
+	} else if m.currentView == viewBilling {
+		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<3>") + " Billing | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<q>") + " Quit"
 	} else {
 		keybindings = keyStyle.Render("<1>") + " Droplets | " + keyStyle.Render("<2>") + " Clusters | " + keyStyle.Render("<:>") + " Command | " + keyStyle.Render("<d>") + " Next | " + keyStyle.Render("<n>") + " Namespace | " + keyStyle.Render("<r>") + " Refresh | " + keyStyle.Render("<esc>") + " Back | " + keyStyle.Render("<q>") + " Quit"
 	}
@@ -2747,7 +2945,19 @@ func truncateString(s string, maxLen int) string {
 func (m model) renderStatusBar() string {
 	// k9s-style footer showing current view type
 	var statusText string
-	if m.currentView == viewClusterResources {
+	if m.currentView == viewBilling {
+		statusText = "<billing>"
+		historyCount := 0
+		if m.billingHistory != nil && m.billingHistory.BillingHistory != nil {
+			historyCount = len(m.billingHistory.BillingHistory)
+		}
+		if m.billingBalance != nil {
+			statusText = fmt.Sprintf("%s | Balance: %s | MTD: %s | Invoices: %d", 
+				statusText, m.billingBalance.AccountBalance, m.billingBalance.MonthToDateBalance, len(m.billingInvoices))
+		} else {
+			statusText = fmt.Sprintf("%s | Invoices: %d | History: %d", statusText, len(m.billingInvoices), historyCount)
+		}
+	} else if m.currentView == viewClusterResources {
 		// Show cluster resource view
 		if m.selectedCluster != nil {
 			statusText = fmt.Sprintf("<%s>", m.clusterResourceType)
@@ -3646,6 +3856,50 @@ func loadSizes(client *godo.Client) tea.Cmd {
 			return errMsg(err)
 		}
 		return sizesLoadedMsg(sizes)
+	}
+}
+
+func loadBalance(client *godo.Client) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		balance, _, err := client.Balance.Get(ctx)
+		if err != nil {
+			return errMsg(err)
+		}
+		return balanceLoadedMsg(balance)
+	}
+}
+
+func loadInvoices(client *godo.Client) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		opt := &godo.ListOptions{PerPage: 50}
+		invoiceList, _, err := client.Invoices.List(ctx, opt)
+		if err != nil {
+			return errMsg(err)
+		}
+		// InvoiceList contains Invoices ([]InvoiceListItem) and InvoicePreview
+		var allInvoices []godo.InvoiceListItem
+		if invoiceList != nil {
+			allInvoices = invoiceList.Invoices
+			// Also include the preview if available
+			if invoiceList.InvoicePreview.InvoiceUUID != "" {
+				allInvoices = append([]godo.InvoiceListItem{invoiceList.InvoicePreview}, allInvoices...)
+			}
+		}
+		return invoicesLoadedMsg(allInvoices)
+	}
+}
+
+func loadBillingHistory(client *godo.Client) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		opt := &godo.ListOptions{PerPage: 100}
+		history, _, err := client.BillingHistory.List(ctx, opt)
+		if err != nil {
+			return errMsg(err)
+		}
+		return billingHistoryLoadedMsg(history)
 	}
 }
 

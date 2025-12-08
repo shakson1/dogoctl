@@ -4,7 +4,7 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets an
 
 ![dogoctl](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.0-blue)
 
 ## ✨ Features
 
@@ -29,6 +29,13 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets an
 - 📊 **Cluster Info**: Display cluster details, version, region, and resource counts in the top panel
 - 🔍 **Resource Details**: View detailed information about Kubernetes resources
 - ⚡ **Real-time Updates**: Refresh cluster resources with loading indicators
+
+### Billing Dashboard
+- 💰 **Account Balance**: View current account balance and month-to-date usage
+- 📄 **Invoice List**: Browse all invoices with UUID, amount, period, and date
+- 📊 **Billing History**: View billing history entries
+- 🔄 **Real-time Refresh**: Reload billing data with loading indicators
+- 📱 **Responsive Layout**: Adapts to terminal window size dynamically
 
 ## 📸 Screenshots
 
@@ -107,6 +114,7 @@ do-droplets
 |-----|--------|
 | `<1>` | Switch to Droplets view |
 | `<2>` | Switch to Kubernetes Clusters view |
+| `<3>` | Switch to Billing Dashboard |
 | `n` | Create a new droplet |
 | `r` | Refresh the current view |
 | `d` | Delete selected droplet (with confirmation) |
@@ -119,9 +127,22 @@ do-droplets
 ### Kubernetes Clusters View
 | Key | Action |
 |-----|--------|
+| `<1>` | Switch to Droplets view |
+| `<2>` | Switch to Kubernetes Clusters view |
+| `<3>` | Switch to Billing Dashboard |
 | `<enter>` | Enter cluster and view resources |
 | `<esc>` | Go back to clusters list |
 | `r` | Refresh clusters list |
+| `q` | Quit |
+
+### Billing Dashboard
+| Key | Action |
+|-----|--------|
+| `<1>` | Switch to Droplets view |
+| `<2>` | Switch to Kubernetes Clusters view |
+| `<3>` | Switch to Billing Dashboard |
+| `r` | Refresh billing data |
+| `<enter>` | View invoice details (if available) |
 | `q` | Quit |
 
 ### Cluster Resources View
@@ -384,7 +405,29 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 For issues, questions, or contributions, please open an issue on GitHub.
 
+## 💰 Billing Dashboard
+
+The billing dashboard provides an overview of your DigitalOcean account's billing information:
+
+1. Press `<3>` to switch to the Billing Dashboard
+2. View your account balance and month-to-date usage in the top panel
+3. Browse invoices in the table showing:
+   - Invoice UUID
+   - Amount
+   - Invoice Period
+   - Date
+4. Press `r` to refresh billing data
+5. Press `<1>`, `<2>`, or `<3>` to switch between views
+
 ## 📋 Changelog
+
+### v1.3.0 (2024)
+- **Billing Dashboard**: 
+  - View account balance and month-to-date usage
+  - Browse invoices with UUID, amount, period, and date
+  - View billing history
+  - Accessible via `<3>` key from any view
+- Improved navigation between views (1=Droplets, 2=Clusters, 3=Billing)
 
 ### v1.2.0 (2024)
 - **Interactive Selection for Droplet Creation**: 
