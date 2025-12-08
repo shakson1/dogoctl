@@ -393,6 +393,8 @@ For issues, questions, or contributions, please open an issue on GitHub.
   - Image selection with 6 supported distributions (Ubuntu, Fedora, Debian, CentOS, AlmaLinux, Rocky Linux)
   - Only x86/x64 images are shown
   - Simplified workflow: only name and tags require typing
+  - Fixed image slug extraction from selection table
+  - Improved error messages with context for droplet creation failures
 - Improved rendering for iTerm windows
 - Better text truncation and responsive column widths
 - Enhanced table rendering for small terminal sizes

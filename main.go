@@ -1676,17 +1676,31 @@ func (m model) updateSelectionMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		// Confirm selection
 		if m.selectionTable.SelectedRow() != nil && len(m.selectionTable.SelectedRow()) > 0 {
-			selectedSlug := m.selectionTable.SelectedRow()[0]
+			var selectedSlug string
 			if m.selectingRegion {
+				// Region table: SLUG is in column 0
+				selectedSlug = m.selectionTable.SelectedRow()[0]
 				m.selectedRegionSlug = selectedSlug
 				m.selectingRegion = false
 				m.inputIndex = 2 // Move to size field
 			} else if m.selectingSize {
+				// Size table: SLUG is in column 0
+				selectedSlug = m.selectionTable.SelectedRow()[0]
 				m.selectedSizeSlug = selectedSlug
 				m.selectingSize = false
 				m.inputIndex = 3 // Move to image field
 			} else if m.selectingImage {
-				m.selectedImageSlug = selectedSlug
+				// Image table: SLUG is in column 2 (DISTRIBUTION, ARCHITECTURE, SLUG)
+				if len(m.selectionTable.SelectedRow()) >= 3 {
+					selectedSlug = m.selectionTable.SelectedRow()[2]
+					// Remove truncation if present (e.g., "ubuntu-22-04-x64..." -> "ubuntu-22-04-x64")
+					selectedSlug = strings.TrimSuffix(selectedSlug, "...")
+					m.selectedImageSlug = selectedSlug
+				} else {
+					// Fallback: try to get from first column if structure is different
+					selectedSlug = m.selectionTable.SelectedRow()[0]
+					m.selectedImageSlug = selectedSlug
+				}
 				m.selectingImage = false
 				m.inputIndex = 4 // Move to tags field
 			}
@@ -1792,16 +1806,12 @@ func (m *model) setupSelectionTable(selectionType string) {
 				}
 			}
 
-			// Truncate slug if needed
-			slug := img.Slug
-			if len(slug) > 33 {
-				slug = slug[:30] + "..."
-			}
-
+			// Don't truncate slug - we need the full slug for API calls
+			// The table will handle display truncation
 			rows = append(rows, table.Row{
 				distribution,
 				architecture,
-				slug,
+				img.Slug, // Use full slug, not truncated
 			})
 		}
 	}
@@ -3772,9 +3782,19 @@ func createDroplet(client *godo.Client, m model) tea.Cmd {
 		}
 
 		ctx := context.Background()
-		droplet, _, err := client.Droplets.Create(ctx, createRequest)
+		droplet, resp, err := client.Droplets.Create(ctx, createRequest)
 		if err != nil {
-			return errMsg(err)
+			// Try to extract more detailed error message from response
+			var errMsgText string
+			if resp != nil && resp.Body != nil {
+				// The godo library should include error details in the error message
+				errMsgText = err.Error()
+			} else {
+				errMsgText = err.Error()
+			}
+			// Add context about what was being created
+			return errMsg(fmt.Errorf("failed to create droplet: %s (region: %s, size: %s, image: %s)",
+				errMsgText, region, size, image))
 		}
 
 		time.Sleep(1 * time.Second)
