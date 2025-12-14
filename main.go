@@ -120,6 +120,26 @@ const (
 	viewBilling          = "billing"
 )
 
+// getTopPadding returns the number of rows to reserve at the top to avoid row 0
+// This is applied globally at the root View() level, not in individual widgets
+func getTopPadding() int {
+	// Check for environment variable override first
+	if envPadding := os.Getenv("DOGOCTL_TOP_PADDING"); envPadding != "" {
+		if padding, err := strconv.Atoi(envPadding); err == nil && padding >= 0 {
+			return padding
+		}
+	}
+
+	// Check terminal type
+	termProgram := os.Getenv("TERM_PROGRAM")
+	if termProgram == "iTerm.app" {
+		return 4 // iTerm2 needs 4 rows for safe rendering (row 0 is under chrome)
+	}
+
+	// Default for other terminals
+	return 1
+}
+
 var (
 	// Colors matching k9s style
 	primaryColor   = lipgloss.Color("39")  // cyan
@@ -1021,9 +1041,9 @@ func (m *model) updateTableDimensions(width, height int) {
 		tableWidth = 50
 	}
 
-	// Calculate available height: total height - top bar - status bar - padding
-	// Status bar: 1 line, padding: 1 line
-	tableHeight := height - topBarHeight - 2
+	// Calculate available height: total height - top padding - top bar - status bar - padding
+	// Top padding: dynamic based on terminal (applied globally), status bar: 1 line, padding: 1 line
+	tableHeight := height - getTopPadding() - topBarHeight - 2
 	if tableHeight < 3 {
 		tableHeight = 3
 	}
@@ -2439,36 +2459,35 @@ func (m model) renderCommandMode() string {
 }
 
 func (m model) View() string {
+	var content string
+
+	// Get the content from the appropriate render function
 	if m.commandMode {
-		return m.renderCommandMode()
-	}
-
-	if m.selectingSSHIP {
-		return m.renderSSHIPSelection()
-	}
-
-	if m.confirmDelete {
-		return m.renderDeleteConfirmation()
-	}
-
-	if m.creating {
-		return m.renderCreateForm()
-	}
-
-	if m.viewingBillingDetails {
-		return m.renderBillingDetails()
-	}
-
-	if m.viewingDetails {
+		content = m.renderCommandMode()
+	} else if m.selectingSSHIP {
+		content = m.renderSSHIPSelection()
+	} else if m.confirmDelete {
+		content = m.renderDeleteConfirmation()
+	} else if m.creating {
+		content = m.renderCreateForm()
+	} else if m.viewingBillingDetails {
+		content = m.renderBillingDetails()
+	} else if m.viewingDetails {
 		if m.selectedDroplet != nil {
-			return m.renderDropletDetails()
+			content = m.renderDropletDetails()
+		} else if m.selectedCluster != nil && m.currentView != viewClusterResources {
+			content = m.renderClusterDetails()
+		} else {
+			content = m.renderMainView()
 		}
-		if m.selectedCluster != nil && m.currentView != viewClusterResources {
-			return m.renderClusterDetails()
-		}
+	} else {
+		content = m.renderMainView()
 	}
 
-	return m.renderMainView()
+	// Apply global top padding at the root level
+	// This ensures consistent padding across all screens and prevents row 0 rendering
+	topPad := getTopPadding()
+	return strings.Repeat("\n", topPad) + content
 }
 
 func (m model) renderMainView() string {
@@ -2506,6 +2525,7 @@ func (m model) renderMainView() string {
 	}
 
 	// Always write the top bar - it should never be empty
+	// Note: Top padding is applied globally in View(), not here
 	s.WriteString(topBar)
 	s.WriteString("\n")
 
@@ -2887,7 +2907,7 @@ func (m model) renderTopBarK9sStyle() string {
 	}
 	leftContent.WriteString(labelStyle.Render("Refresh: ") + valueStyle.Render(refreshTime))
 	leftContent.WriteString("\n")
-	leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.4.0"))
+	leftContent.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.4.1"))
 
 	// iTerm-optimized: Better padding for left panel
 	leftPanel := lipgloss.NewStyle().
@@ -3251,13 +3271,13 @@ func (m model) renderTopBarThreePanel() string {
 		accountInfo.WriteString("\n")
 	}
 
-	accountInfo.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.4.0"))
+	accountInfo.WriteString(labelStyle.Render("Version: ") + valueStyle.Render("dogoctl v1.4.1"))
 
 	// Render the left panel - ensure it's always visible with summary
 	leftPanelContent := accountInfo.String()
 	// CRITICAL: Ensure content is not empty
 	if strings.TrimSpace(leftPanelContent) == "" {
-		leftPanelContent = fmt.Sprintf("DigitalOcean\n\nDroplets: %d\nRegion: %s\nRefresh: N/A\nVersion: dogoctl v1.4.0",
+		leftPanelContent = fmt.Sprintf("DigitalOcean\n\nDroplets: %d\nRegion: %s\nRefresh: N/A\nVersion: dogoctl v1.4.1",
 			m.dropletCount, m.selectedRegion)
 	}
 	// Render with proper width - ensure content is visible
@@ -3444,7 +3464,7 @@ func (m model) renderSSHIPSelection() string {
 	privateIP := getPrivateIP(*m.selectedDroplet)
 
 	var s strings.Builder
-	s.WriteString("\n")
+	// Note: Top padding is applied globally in View(), not here
 	s.WriteString(headerStyle.Render("🔌 Select IP Address for SSH"))
 	s.WriteString("\n\n")
 
@@ -3497,7 +3517,7 @@ func (m model) renderSSHIPSelection() string {
 
 func (m model) renderDeleteConfirmation() string {
 	var s strings.Builder
-	s.WriteString("\n")
+	// Note: Top padding is applied globally in View(), not here
 
 	// Dynamic box width based on terminal size
 	boxWidth := min(m.width-4, 60)
@@ -3537,7 +3557,7 @@ func (m model) renderCreateForm() string {
 	}
 
 	var s strings.Builder
-	s.WriteString("\n")
+	// Note: Top padding is applied globally in View(), not here
 
 	formTitle := headerStyle.Render("✨ Create New Droplet")
 	s.WriteString(formTitle)
@@ -3634,7 +3654,7 @@ func (m model) renderCreateForm() string {
 
 func (m model) renderSelectionView() string {
 	var s strings.Builder
-	s.WriteString("\n")
+	// Note: Top padding is applied globally in View(), not here
 
 	var title string
 	if m.selectingRegion {
@@ -3665,6 +3685,7 @@ func (m model) renderDropletDetails() string {
 
 	d := m.selectedDroplet
 	var s strings.Builder
+	// Note: Top padding is applied globally in View(), not here
 
 	// Header with status
 	statusColor := successColor
@@ -3802,6 +3823,7 @@ func (m model) renderClusterDetails() string {
 
 	c := m.selectedCluster
 	var s strings.Builder
+	// Note: Top padding is applied globally in View(), not here
 
 	// Header with status
 	status := string(c.Status.State)
@@ -3902,6 +3924,8 @@ func (m model) renderClusterDetails() string {
 
 func (m model) renderBillingDetails() string {
 	var s strings.Builder
+	// Note: Top padding is applied globally in View(), not here
+
 	labelStyle := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Width(20)
 	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
 
@@ -3914,8 +3938,8 @@ func (m model) renderBillingDetails() string {
 		boxWidth = m.width - 4
 	}
 
-	// Calculate available height for content (terminal height minus header and help text)
-	availableHeight := m.height - 6 // Reserve space for header, padding, and help text
+	// Calculate available height for content (terminal height minus top padding, header and help text)
+	availableHeight := m.height - getTopPadding() - 6 // Reserve space for top padding, header, padding, and help text
 	if availableHeight < 5 {
 		availableHeight = 5
 	}

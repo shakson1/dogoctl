@@ -4,7 +4,7 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets an
 
 ![dogoctl](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Version](https://img.shields.io/badge/version-1.4.0-blue)
+![Version](https://img.shields.io/badge/version-1.4.1-blue)
 
 ## ✨ Features
 
@@ -366,11 +366,20 @@ The TUI works best with modern terminals that support:
 - Minimum 80x24 character size
 
 Recommended terminals:
-- iTerm2 (macOS)
-- Terminal.app (macOS)
+- iTerm2 (macOS) - Automatically uses 4 rows of top padding to avoid window chrome
+- Terminal.app (macOS) - Uses 1 row of top padding
 - Windows Terminal (Windows)
 - Alacritty
 - Kitty
+
+**Top Padding Configuration**:
+- The TUI automatically adjusts top padding based on your terminal:
+  - iTerm2: 4 rows (to avoid window chrome clipping)
+  - Other terminals: 1 row
+- You can override the default padding by setting the `DOGOCTL_TOP_PADDING` environment variable:
+  ```bash
+  export DOGOCTL_TOP_PADDING=3  # Use 3 rows of padding
+  ```
 
 ## 🛠️ Development
 
@@ -461,6 +470,16 @@ When viewing detailed invoice or billing entry information:
 - Press `m` to switch to monthly view, `i` to switch to invoices view
 
 ## 📋 Changelog
+
+### v1.4.1 (2024)
+- **Terminal Compatibility Fix**:
+  - Fixed top header clipping in iTerm2 by implementing dynamic top padding
+  - Added global root-level padding system (applied once at View() level)
+  - iTerm2: Uses 4 rows of top padding to avoid window chrome
+  - Other terminals: Uses 1 row of top padding
+  - Environment variable override: `DOGOCTL_TOP_PADDING` can override default padding
+  - Ensures all screens (droplets, clusters, billing, details, forms) have consistent padding
+  - No content renders at row 0, preventing clipping issues
 
 ### v1.4.0 (2024)
 - **Enhanced Billing Dashboard**:
