@@ -4,7 +4,7 @@ A beautiful, interactive terminal UI (TUI) for managing DigitalOcean droplets an
 
 ![dogoctl](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Version](https://img.shields.io/badge/version-1.4.1-blue)
+![Version](https://img.shields.io/badge/version-1.4.2-blue)
 
 ## ✨ Features
 
@@ -73,12 +73,12 @@ go mod download
 
 3. Build the application:
 ```bash
-go build -o do-droplets
+go build -o dogoctl
 ```
 
 4. (Optional) Install to your PATH:
 ```bash
-sudo mv do-droplets /usr/local/bin/
+sudo mv dogoctl /usr/local/bin/
 ```
 
 ## ⚙️ Configuration
@@ -102,12 +102,12 @@ source ~/.zshrc
 Run the application:
 
 ```bash
-./do-droplets
+./dogoctl
 ```
 
 Or if installed globally:
 ```bash
-do-droplets
+dogoctl
 ```
 
 ## ⌨️ Keyboard Shortcuts
@@ -318,7 +318,7 @@ All images are automatically filtered to show only x86/x64 architectures.
 export DO_TOKEN=dop_v1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Run the application
-./do-droplets
+./dogoctl
 
 # Switch to clusters view
 # Press <2>
@@ -393,7 +393,7 @@ Recommended terminals:
 ```bash
 git clone git@github.com:shakson1/dogoctl.git
 cd dogoctl
-go build -o do-droplets
+go build -o dogoctl
 ```
 
 ### Running Tests
@@ -470,6 +470,14 @@ When viewing detailed invoice or billing entry information:
 - Press `m` to switch to monthly view, `i` to switch to invoices view
 
 ## 📋 Changelog
+
+### v1.4.2 (2024)
+- **SSH Terminal Improvements**:
+  - Enhanced terminal emulator integration with govte
+  - Improved newline handling and terminal output rendering
+  - Better support for interactive programs (htop, etc.)
+  - Fixed command input handling and terminal state management
+- Updated binary name from `do-droplets` to `dogoctl` for consistency
 
 ### v1.4.1 (2024)
 - **Terminal Compatibility Fix**:

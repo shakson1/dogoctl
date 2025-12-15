@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -14,6 +16,9 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/cliofy/govte"
+	"github.com/cliofy/govte/terminal"
+	"github.com/creack/pty/v2"
 	"github.com/digitalocean/godo"
 	"golang.org/x/oauth2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -91,6 +96,18 @@ type model struct {
 	selectedBillingEntry  *godo.BillingHistoryEntry // Selected billing entry for details
 	detailedInvoice       *godo.Invoice             // Full invoice details loaded from API
 	billingDetailsScroll  int                       // Scroll position for billing details view
+	// SSH terminal state
+	sshTerminalActive      bool                     // When true, show SSH terminal view
+	sshTerminalRawOutput   *strings.Builder         // Raw terminal output buffer (for debugging only, not used for display)
+	sshTerminalEmulator    *terminal.TerminalBuffer // Terminal emulator - SINGLE SOURCE OF TRUTH for rendering
+	sshTerminalParser      *govte.Parser            // Parser for ANSI escape sequences
+	sshTerminalPTY         *os.File                 // PTY file for SSH connection
+	sshTerminalCmd         *exec.Cmd                // SSH command process
+	sshTerminalHost        string                   // Connected host name
+	sshTerminalIP          string                   // Connected IP address
+	sshTerminalMutex       sync.Mutex               // Mutex for thread-safe terminal output access
+	sshOutputChan          chan tea.Msg             // Channel for SSH output messages
+	sshTerminalConfirmExit bool                     // When true, show exit confirmation dialog
 }
 
 type errMsg error
@@ -112,6 +129,7 @@ type balanceLoadedMsg *godo.Balance
 type invoicesLoadedMsg []godo.InvoiceListItem
 type billingHistoryLoadedMsg *godo.BillingHistory
 type invoiceDetailsLoadedMsg *godo.Invoice
+type sshTerminalOutputMsg string // New line of output from SSH terminal
 
 const (
 	viewDroplets         = "droplets"
@@ -151,9 +169,9 @@ var (
 	borderColor    = lipgloss.Color("39")  // cyan
 	highlightColor = lipgloss.Color("226") // yellow for highlights
 
-	// SSH connection info (set when user wants to SSH)
-	sshIP   string
-	sshName string
+	// SSH connection info (deprecated - now using model fields)
+	// sshIP   string
+	// sshName string
 
 	// Panel styles
 	panelStyle = lipgloss.NewStyle().
@@ -327,20 +345,32 @@ func initialModel(client *godo.Client) model {
 			selTable.SetStyles(selStyles)
 			return selTable
 		}(),
-		billingBalance:        nil,
-		billingInvoices:       []godo.InvoiceListItem{},
-		billingHistory:        nil,
-		billingMode:           "invoices", // Default to invoices view
-		selectedBillingMonth:  "",
-		viewingBillingDetails: false,
-		selectedInvoice:       nil,
-		selectedBillingEntry:  nil,
-		detailedInvoice:       nil,
-		billingDetailsScroll:  0,
+		billingBalance:         nil,
+		billingInvoices:        []godo.InvoiceListItem{},
+		billingHistory:         nil,
+		billingMode:            "invoices", // Default to invoices view
+		selectedBillingMonth:   "",
+		viewingBillingDetails:  false,
+		selectedInvoice:        nil,
+		selectedBillingEntry:   nil,
+		detailedInvoice:        nil,
+		billingDetailsScroll:   0,
+		sshTerminalActive:      false,
+		sshTerminalRawOutput:   &strings.Builder{}, // Use pointer to avoid copy issues
+		sshTerminalEmulator:    nil,
+		sshTerminalParser:      nil,
+		sshTerminalPTY:         nil,
+		sshTerminalCmd:         nil,
+		sshTerminalHost:        "",
+		sshTerminalIP:          "",
+		sshOutputChan:          make(chan tea.Msg, 100), // Buffered channel for SSH output
+		sshTerminalConfirmExit: false,                   // No confirmation dialog initially
 	}
 }
 
 func (m model) Init() tea.Cmd {
+	// Set loading state to show spinner while fetching data
+	m.loading = true
 	return tea.Batch(
 		loadDroplets(m.client),
 		loadClusters(m.client),
@@ -360,6 +390,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Handle command mode first
 		if m.commandMode {
 			return m.updateCommandMode(msg)
+		}
+
+		// Handle SSH terminal mode - all input goes to SSH terminal emulator
+		if m.sshTerminalActive {
+			return m.updateSSHTerminal(msg)
 		}
 
 		// Handle SSH IP selection menu
@@ -475,13 +510,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						ip = privateIP
 					}
 
-					// Store SSH info and exit program
-					sshIP = ip
-					sshName = d.Name
-					return m, tea.Sequence(
-						tea.ExitAltScreen,
-						tea.Quit,
-					)
+					// Start SSH terminal view
+					return m.startSSHTerminalView(ip, d.Name)
 				}
 				return m, nil
 			case "esc", "enter", "backspace":
@@ -681,13 +711,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								ip = privateIP
 							}
 
-							// Store SSH info and exit program
-							sshIP = ip
-							sshName = d.Name
-							return m, tea.Sequence(
-								tea.ExitAltScreen,
-								tea.Quit,
-							)
+							// Start SSH terminal view
+							return m.startSSHTerminalView(ip, d.Name)
 						}
 					}
 				}
@@ -971,7 +996,103 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.creating = false
 		m.loading = false
 		m.confirmDelete = false
+		// If error occurs during SSH, close terminal
+		if m.sshTerminalActive {
+			m.closeSSHTerminal()
+		}
 		return m, nil
+
+	case sshTerminalStartedMsg:
+		// SSH terminal started, store PTY and start polling for output immediately
+		m.sshTerminalPTY = msg.ptmx
+		m.sshTerminalCmd = msg.cmd
+		m.sshTerminalHost = msg.name
+		m.sshTerminalIP = msg.ip
+
+		// CRITICAL: Set PTY size immediately with current window dimensions
+		// ncurses apps need accurate terminal size from the start
+		if m.sshTerminalPTY != nil {
+			availableRows := m.height - getTopPadding() - 6 // Header + padding + help text
+			if availableRows < 5 {
+				availableRows = 5
+			}
+			availableCols := m.width - 4 // Account for border and padding
+			if availableCols < 40 {
+				availableCols = 40
+			}
+			pty.Setsize(m.sshTerminalPTY, &pty.Winsize{
+				Rows: uint16(availableRows),
+				Cols: uint16(availableCols),
+			})
+			// Also update terminal emulator size
+			if m.sshTerminalEmulator != nil {
+				m.sshTerminalEmulator.Resize(availableCols, availableRows)
+			}
+		}
+
+		// Start polling immediately with a fast ticker
+		cmds = append(cmds, waitForSSHOutput(m.sshOutputChan))
+		return m, tea.Batch(cmds...)
+
+	case sshTerminalOutputMsg:
+		// New output from SSH - process through terminal emulator
+		// CRITICAL: Use VTE to interpret ANSI escape sequences properly
+		// The terminal emulator is the SINGLE SOURCE OF TRUTH for display
+		m.sshTerminalMutex.Lock()
+		output := string(msg)
+		if len(output) > 0 {
+			// Process output through terminal emulator to interpret ANSI sequences
+			// This handles: cursor positioning, screen clearing (\r, \x1b[K, \x1b[2K), etc.
+			// CRITICAL: Process ALL bytes including newlines, carriage returns, etc.
+			if m.sshTerminalEmulator != nil && m.sshTerminalParser != nil {
+				// Process all bytes through the parser
+				// CRITICAL: Convert string back to []byte to preserve ALL control characters
+				// This ensures \n, \r, and all ANSI sequences are processed correctly
+				outputBytes := []byte(output)
+
+				// Process all bytes through the parser
+				// The parser will call methods on the terminal buffer to update the screen
+				// This MUST process every byte including \n, \r, and all ANSI sequences
+				// The emulator maintains the screen state including cursor position
+				//
+				// CRITICAL: Newlines (\n) should move cursor to next line in the buffer
+				// Carriage returns (\r) should move cursor to start of current line
+				// The emulator handles all of this - we just feed it the raw bytes
+				m.sshTerminalParser.Advance(m.sshTerminalEmulator, outputBytes)
+			}
+			// Keep raw output buffer only for debugging/fallback (not used for display)
+			if m.sshTerminalRawOutput != nil {
+				m.sshTerminalRawOutput.WriteString(output)
+				// Limit raw output buffer size (keep last 1MB for debugging)
+				rawOutputStr := m.sshTerminalRawOutput.String()
+				if len(rawOutputStr) > 1024*1024 { // 1MB
+					keepFrom := len(rawOutputStr) - 1024*1024
+					m.sshTerminalRawOutput.Reset()
+					m.sshTerminalRawOutput.WriteString(rawOutputStr[keepFrom:])
+				}
+			}
+			// The terminal emulator buffer is the SINGLE SOURCE OF TRUTH for rendering
+			// All output is processed through the emulator which handles ANSI sequences correctly
+		}
+		m.sshTerminalMutex.Unlock()
+		// Continue waiting for more output
+		cmds = append(cmds, waitForSSHOutput(m.sshOutputChan))
+		return m, tea.Batch(cmds...)
+
+	case sshTerminalClosedMsg:
+		// SSH connection closed
+		m.closeSSHTerminal()
+		return m, nil
+
+	case time.Time:
+		// Ticker message - this is from our SSH output poller
+		// If we're in SSH terminal mode, keep the ticker running
+		if m.sshTerminalActive && m.sshTerminalPTY != nil {
+			// The ticker itself returns time.Time, so this means no message was available
+			// Just restart the ticker to keep polling
+			cmds = append(cmds, waitForSSHOutput(m.sshOutputChan))
+		}
+		return m, tea.Batch(cmds...)
 
 	case tea.WindowSizeMsg:
 		// iTerm optimization: Store raw dimensions accurately
@@ -999,11 +1120,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = rawWidth
 		m.height = rawHeight
 
+		// Update PTY size when window resizes (if SSH terminal is active)
+		// CRITICAL: ncurses apps need accurate terminal size for proper rendering
+		if m.sshTerminalPTY != nil {
+			// Calculate available terminal size (accounting for header and padding)
+			availableRows := rawHeight - getTopPadding() - 6 // Header + padding + help text
+			if availableRows < 5 {
+				availableRows = 5 // Minimum size
+			}
+			availableCols := rawWidth - 4 // Account for border and padding
+			if availableCols < 40 {
+				availableCols = 40 // Minimum width
+			}
+			pty.Setsize(m.sshTerminalPTY, &pty.Winsize{
+				Rows: uint16(availableRows),
+				Cols: uint16(availableCols),
+			})
+			// Also update terminal emulator size
+			if m.sshTerminalEmulator != nil {
+				m.sshTerminalEmulator.Resize(availableCols, availableRows)
+			}
+		}
+
 		// Immediately update all dynamic components
 		m.updateAllDimensions(rawWidth, rawHeight)
 
-		// Return nil to trigger a re-render
-		return m, nil
+		// Return commands to trigger a re-render
+		return m, tea.Batch(cmds...)
 	}
 
 	if !m.loading && !m.creating && !m.viewingDetails && !m.confirmDelete && !m.selectingSSHIP {
@@ -2051,15 +2194,10 @@ func (m model) updateSSHIPSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.selectedDroplet != nil {
 			publicIP := getPublicIP(*m.selectedDroplet)
 			if publicIP != "" {
-				m.sshIPType = "public"
-				sshIP = publicIP
-				sshName = m.selectedDroplet.Name
 				m.selectingSSHIP = false
+				dropletName := m.selectedDroplet.Name
 				m.selectedDroplet = nil
-				return m, tea.Sequence(
-					tea.ExitAltScreen,
-					tea.Quit,
-				)
+				return m.startSSHTerminalView(publicIP, dropletName)
 			}
 		}
 		return m, nil
@@ -2068,15 +2206,10 @@ func (m model) updateSSHIPSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.selectedDroplet != nil {
 			privateIP := getPrivateIP(*m.selectedDroplet)
 			if privateIP != "" {
-				m.sshIPType = "private"
-				sshIP = privateIP
-				sshName = m.selectedDroplet.Name
 				m.selectingSSHIP = false
+				dropletName := m.selectedDroplet.Name
 				m.selectedDroplet = nil
-				return m, tea.Sequence(
-					tea.ExitAltScreen,
-					tea.Quit,
-				)
+				return m.startSSHTerminalView(privateIP, dropletName)
 			}
 		}
 		return m, nil
@@ -2462,7 +2595,9 @@ func (m model) View() string {
 	var content string
 
 	// Get the content from the appropriate render function
-	if m.commandMode {
+	if m.sshTerminalActive {
+		content = m.renderSSHTerminal()
+	} else if m.commandMode {
 		content = m.renderCommandMode()
 	} else if m.selectingSSHIP {
 		content = m.renderSSHIPSelection()
@@ -3513,6 +3648,210 @@ func (m model) renderSSHIPSelection() string {
 		Render(s.String())
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
+}
+
+func (m model) renderSSHTerminal() string {
+	var s strings.Builder
+
+	// Show exit confirmation dialog if needed
+	if m.sshTerminalConfirmExit {
+		return m.renderSSHExitConfirmation()
+	}
+
+	// Prominent header showing connection info - make it very visible
+	hostInfo := fmt.Sprintf("🔌 Connected to: %s", m.sshTerminalHost)
+	ipInfo := fmt.Sprintf("IP: %s", m.sshTerminalIP)
+
+	headerStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(primaryColor).
+		BorderTop(true).
+		BorderBottom(true).
+		BorderLeft(true).
+		BorderRight(true).
+		Padding(1, 2).
+		Width(m.width - 2).
+		Foreground(lipgloss.Color("255")).
+		Background(primaryColor).
+		Bold(true)
+
+	hostStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("255")).
+		Bold(true).
+		Background(primaryColor)
+
+	ipStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("229")).
+		Background(primaryColor)
+
+	headerContent := fmt.Sprintf("%s  |  %s",
+		hostStyle.Render(hostInfo),
+		ipStyle.Render(ipInfo))
+
+	headerBox := headerStyle.Render(headerContent)
+	s.WriteString(headerBox)
+	s.WriteString("\n")
+
+	// Terminal output area - reserve space for header and padding
+	availableHeight := m.height - getTopPadding() - 6 // Header + padding + help text
+	if availableHeight < 5 {
+		availableHeight = 5
+	}
+
+	// CRITICAL: Calculate display dimensions - must match PTY and emulator sizes exactly
+	displayCols := m.width - 4 // Account for border and padding
+	displayRows := availableHeight
+
+	// Render terminal output - use terminal emulator as SINGLE SOURCE OF TRUTH
+	// CRITICAL: The emulator IS the screen buffer - render it exactly as-is
+	// No line manipulation, no splitting, no padding - just render the buffer directly
+	m.sshTerminalMutex.Lock()
+	var displayContent string
+
+	// Use terminal emulator as SINGLE SOURCE OF TRUTH for rendering
+	// The emulator maintains a cell-by-cell screen buffer
+	if m.sshTerminalEmulator != nil {
+		// CRITICAL: Ensure emulator size matches display area exactly BEFORE getting display
+		// Size mismatch causes cursor positioning errors, broken rendering, etc.
+		currentWidth, currentHeight := m.sshTerminalEmulator.Dimensions()
+		if currentWidth != displayCols || currentHeight != displayRows {
+			// Resize emulator to match display area exactly
+			m.sshTerminalEmulator.Resize(displayCols, displayRows)
+		}
+
+		// Get the screen buffer directly from emulator
+		// GetDisplayWithColors() returns the screen state with ANSI color codes
+		// The emulator maintains a cell-by-cell screen buffer of size displayRows x displayCols
+		//
+		// CRITICAL: The emulator processes ALL escape sequences:
+		// - Newlines (\n) - moves cursor to next line, creates new row in buffer
+		// - Carriage returns (\r) - moves cursor to start of current line
+		// - Line clearing (ESC[K, ESC[2K) - clears line content
+		// - Cursor positioning - all handled by emulator
+		//
+		// GetDisplayWithColors() returns a string representation of the screen buffer
+		// The format should be: each screen row as one line, separated by \n
+		// Each line contains ANSI color codes and is exactly displayCols characters
+		displayContent = m.sshTerminalEmulator.GetDisplayWithColors()
+
+		// CRITICAL: Verify and ensure proper line structure
+		// GetDisplayWithColors() should return displayRows lines separated by \n
+		// If it doesn't, we need to fix it
+		lines := strings.Split(displayContent, "\n")
+
+		// Remove empty trailing line if present
+		if len(lines) > 0 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+
+		// CRITICAL: We MUST have exactly displayRows lines
+		// Each line represents one screen row - missing lines cause rendering issues
+		if len(lines) < displayRows {
+			// Pad with empty lines (screen hasn't filled all rows yet)
+			for len(lines) < displayRows {
+				lines = append(lines, "")
+			}
+		} else if len(lines) > displayRows {
+			// Take only the last displayRows lines (most recent screen content)
+			lines = lines[len(lines)-displayRows:]
+		}
+
+		// Join with \n - CRITICAL: This creates visual line breaks
+		// Without \n separators, lines will overlap and render incorrectly
+		// Each \n in the final output creates a new line in the terminal
+		displayContent = strings.Join(lines, "\n")
+	} else {
+		// Emulator not initialized yet - show connection message
+		displayContent = fmt.Sprintf("🔌 Connecting to %s (%s)...", m.sshTerminalHost, m.sshTerminalIP)
+		// Pad to fill available space (only for connection message, not terminal output)
+		lines := []string{displayContent}
+		for len(lines) < displayRows {
+			lines = append(lines, "")
+		}
+		displayContent = strings.Join(lines, "\n")
+	}
+	m.sshTerminalMutex.Unlock()
+
+	// displayContent is the screen buffer from terminal emulator
+	// It contains ANSI color codes and represents the current terminal state
+	// Each line is exactly displayCols characters wide (from emulator)
+	// Lines are separated by \n
+	//
+	// CRITICAL: Render with minimal lipgloss styling to preserve newlines
+	// Padding(1, 1) should preserve newlines, but we'll render directly
+	// The emulator buffer already has the correct format with proper newlines
+	terminalBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Padding(1, 1).
+		Render(displayContent)
+
+	s.WriteString(terminalBox)
+	s.WriteString("\n\n")
+
+	// Help text with host reminder
+	hostReminder := fmt.Sprintf("Host: %s", m.sshTerminalHost)
+	helpText := helpStyle.Render(fmt.Sprintf("%s  |  [ctrl+c] Terminate Process  [esc] Exit SSH",
+		hostReminder))
+	s.WriteString(helpText)
+	s.WriteString("\n")
+
+	return s.String()
+}
+
+// renderSSHExitConfirmation renders the exit confirmation dialog
+func (m model) renderSSHExitConfirmation() string {
+	var s strings.Builder
+
+	// Prominent header still visible
+	hostInfo := fmt.Sprintf("🔌 Connected to: %s", m.sshTerminalHost)
+	ipInfo := fmt.Sprintf("IP: %s", m.sshTerminalIP)
+
+	headerStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(primaryColor).
+		BorderTop(true).
+		BorderBottom(true).
+		BorderLeft(true).
+		BorderRight(true).
+		Padding(1, 2).
+		Width(m.width - 2).
+		Foreground(lipgloss.Color("255")).
+		Background(primaryColor).
+		Bold(true)
+
+	hostStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("255")).
+		Bold(true).
+		Background(primaryColor)
+
+	ipStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("229")).
+		Background(primaryColor)
+
+	headerContent := fmt.Sprintf("%s  |  %s",
+		hostStyle.Render(hostInfo),
+		ipStyle.Render(ipInfo))
+
+	headerBox := headerStyle.Render(headerContent)
+	s.WriteString(headerBox)
+	s.WriteString("\n\n")
+
+	// Confirmation dialog
+	confirmText := fmt.Sprintf("⚠️  Close SSH connection to %s?", m.sshTerminalHost)
+	confirmBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(warningColor).
+		Padding(2, 4).
+		Width(m.width - 4).
+		Render(fmt.Sprintf("%s\n\n%s\n\n%s",
+			confirmText,
+			keyStyle.Render("[y]")+" Yes, close connection  |  "+keyStyle.Render("[n]")+" No, cancel",
+			keyStyle.Render("[esc]")+" Cancel"))
+
+	s.WriteString(lipgloss.Place(m.width, m.height-6, lipgloss.Center, lipgloss.Center, confirmBox))
+
+	return s.String()
 }
 
 func (m model) renderDeleteConfirmation() string {
@@ -4799,24 +5138,356 @@ func deleteDroplet(client *godo.Client, id int) tea.Cmd {
 	}
 }
 
-// executeSSH executes an SSH connection to the droplet
-// This should be called after the tea program exits
-func executeSSH(ip, name string) error {
-	fmt.Printf("\n🔌 Connecting to %s (%s)...\n\n", name, ip)
-
-	// SSH command
-	cmd := exec.Command("ssh", ip)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// Execute SSH (this will block until SSH session ends)
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("SSH connection to %s (%s) failed: %v", name, ip, err)
+// startSSHTerminalView starts the SSH terminal view
+func (m *model) startSSHTerminalView(ip, name string) (tea.Model, tea.Cmd) {
+	m.sshTerminalActive = true
+	m.sshTerminalHost = name
+	m.sshTerminalIP = ip
+	// Initialize terminal emulator - this is the SINGLE SOURCE OF TRUTH for rendering
+	// Initialize raw output buffer if needed
+	if m.sshTerminalRawOutput == nil {
+		m.sshTerminalRawOutput = &strings.Builder{}
+	} else {
+		m.sshTerminalRawOutput.Reset()
 	}
 
+	// CRITICAL: Initialize terminal emulator with correct size
+	// Calculate available display size (must match what we'll render)
+	availableRows := m.height - getTopPadding() - 6 // Header + padding + help text
+	if availableRows < 5 {
+		availableRows = 5
+	}
+	availableCols := m.width - 4 // Account for border and padding
+	if availableCols < 40 {
+		availableCols = 40
+	}
+	// Create terminal buffer with exact display dimensions
+	// This ensures cursor positioning and screen updates work correctly
+	m.sshTerminalEmulator = terminal.NewTerminalBuffer(availableCols, availableRows)
+	m.sshTerminalParser = govte.NewParser()
+
+	// Start SSH connection - the started message will trigger output polling
+	return m, startSSHTerminal(ip, name, m.sshOutputChan)
+}
+
+// startSSHTerminal starts an SSH connection in a PTY
+func startSSHTerminal(ip, name string, outputChan chan<- tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		// Create SSH command with options to avoid hanging
+		cmd := exec.Command("ssh",
+			"-tt", // Force TTY allocation for interactive programs (needed for htop)
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "LogLevel=ERROR",
+			ip)
+
+		// CRITICAL: Set TERM environment variable for proper terminal emulation
+		// ncurses apps like htop need this to know terminal capabilities
+		// Use xterm-256color for full color and capability support
+		termType := os.Getenv("TERM")
+		if termType == "" {
+			// Default to xterm-256color if TERM is not set
+			termType = "xterm-256color"
+		}
+		// Ensure we use a terminal type that supports full capabilities
+		// xterm-256color is widely supported and has all features needed for htop
+		if termType != "xterm-256color" && termType != "screen-256color" && termType != "tmux-256color" {
+			termType = "xterm-256color"
+		}
+		cmd.Env = append(os.Environ(), "TERM="+termType)
+
+		// Create PTY with proper initial size
+		// The size will be updated when we get the actual window size
+		// Use reasonable defaults that will be updated immediately
+		ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
+			Rows: 24, // Will be updated on first WindowSizeMsg
+			Cols: 80, // Will be updated on first WindowSizeMsg
+		})
+		if err != nil {
+			return errMsg(fmt.Errorf("failed to start SSH: %v", err))
+		}
+
+		// Start reading output in a goroutine immediately
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					outputChan <- errMsg(fmt.Errorf("panic in SSH reader: %v", r))
+				}
+			}()
+
+			// Read directly from PTY - preserve ALL bytes including ANSI sequences
+			buf := make([]byte, 4096) // Larger buffer for better performance
+			for {
+				n, err := ptmx.Read(buf)
+				if err != nil {
+					if err == io.EOF {
+						outputChan <- sshTerminalOutputMsg("\r\n[Connection closed]\r\n")
+						outputChan <- sshTerminalClosedMsg{}
+						return
+					}
+					outputChan <- errMsg(fmt.Errorf("SSH read error: %v", err))
+					return
+				}
+				if n > 0 {
+					// Send output immediately - preserve ALL bytes (ANSI sequences, control chars, etc.)
+					outputChan <- sshTerminalOutputMsg(string(buf[:n]))
+				}
+			}
+		}()
+
+		// Return the PTY and command for the model to store
+		return sshTerminalStartedMsg{ptmx: ptmx, cmd: cmd, ip: ip, name: name}
+	}
+}
+
+// sshTerminalStartedMsg is sent when SSH terminal starts
+type sshTerminalStartedMsg struct {
+	ptmx *os.File
+	cmd  *exec.Cmd
+	ip   string
+	name string
+}
+
+// waitForSSHOutput waits for messages from the SSH output channel
+// Uses a continuous ticker to poll the channel non-blockingly
+func waitForSSHOutput(outputChan <-chan tea.Msg) tea.Cmd {
+	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
+		select {
+		case msg := <-outputChan:
+			// Got a message, return it
+			return msg
+		default:
+			// No message yet, return time to keep ticker running
+			return t
+		}
+	})
+}
+
+// sshTerminalClosedMsg is sent when SSH connection closes
+type sshTerminalClosedMsg struct{}
+
+// updateSSHTerminal handles keyboard input for SSH terminal
+func (m *model) updateSSHTerminal(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Handle exit confirmation dialog
+	if m.sshTerminalConfirmExit {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "y", "Y":
+				// Confirm exit
+				m.sshTerminalConfirmExit = false
+				m.closeSSHTerminal()
+				return m, nil
+			case "n", "N", "esc":
+				// Cancel exit
+				m.sshTerminalConfirmExit = false
+				return m, nil
+			default:
+				return m, nil
+			}
+		default:
+			return m, nil
+		}
+	}
+
+	// Forward all other input to SSH
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		return m.handleSSHInput(keyMsg)
+	}
+
+	return m, nil
+}
+
+// writeToPTY writes bytes to the SSH PTY, handling errors gracefully
+func (m *model) writeToPTY(b []byte) error {
+	if m.sshTerminalPTY == nil {
+		return fmt.Errorf("PTY is nil")
+	}
+	_, err := m.sshTerminalPTY.Write(b)
+	if err != nil {
+		// PTY write failed - connection might be closed
+		m.err = fmt.Errorf("failed to write to PTY: %v", err)
+		m.closeSSHTerminal()
+		return err
+	}
 	return nil
+}
+
+// handleSSHInput forwards keyboard input to the SSH session
+func (m *model) handleSSHInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Handle Esc key - show exit confirmation dialog
+	if msg.Type == tea.KeyEsc || msg.String() == "esc" {
+		if !m.sshTerminalConfirmExit {
+			m.sshTerminalConfirmExit = true
+			return m, nil
+		}
+		// If already in confirmation, cancel it
+		m.sshTerminalConfirmExit = false
+		return m, nil
+	}
+
+	// NO LOCAL SCROLLING - terminal emulator IS the screen buffer
+	// All keys (including pageup/pagedown) are forwarded to SSH
+	// The terminal emulator handles its own scrollback internally
+
+	// All other keys are forwarded to SSH
+	// This includes: regular typing, Enter, Backspace, Tab, arrows, function keys, etc.
+
+	if m.sshTerminalPTY == nil {
+		// PTY not ready yet - ignore input
+		return m, nil
+	}
+
+	var keyBytes []byte
+
+	// CRITICAL: Check for special control keys FIRST
+	// These must be handled before checking runes
+	switch msg.Type {
+	case tea.KeyEnter:
+		// Enter key - send carriage return to execute command
+		keyBytes = []byte("\r")
+	case tea.KeyBackspace:
+		// Backspace - send DEL (0x7f) for proper terminal behavior
+		// Note: \b (0x08) is backspace, but terminals expect DEL (0x7f)
+		keyBytes = []byte{0x7f}
+	case tea.KeyTab:
+		keyBytes = []byte("\t")
+	case tea.KeySpace:
+		keyBytes = []byte(" ")
+	case tea.KeyCtrlC:
+		// Ctrl+C - send SIGINT (ASCII 3) to terminate remote process
+		keyBytes = []byte{3}
+	case tea.KeyCtrlD:
+		// Ctrl+D - send EOF (ASCII 4) to close input stream
+		keyBytes = []byte{4}
+	case tea.KeyCtrlZ:
+		// Ctrl+Z - send SUSP (ASCII 26) to suspend process
+		keyBytes = []byte{26}
+	case tea.KeyUp, tea.KeyDown, tea.KeyLeft, tea.KeyRight:
+		// Arrow keys - send ANSI escape sequences
+		// These are critical for command history and interactive programs like htop
+		keyBytes = getANSISequence(msg.Type)
+	case tea.KeyDelete:
+		// Delete key - send ANSI sequence
+		keyBytes = getANSISequence(msg.Type)
+	case tea.KeyF1, tea.KeyF2, tea.KeyF3, tea.KeyF4, tea.KeyF5, tea.KeyF6,
+		tea.KeyF7, tea.KeyF8, tea.KeyF9, tea.KeyF10, tea.KeyF11, tea.KeyF12:
+		// Function keys - needed for htop, vim, etc.
+		keyBytes = getFunctionKeySequence(msg.Type)
+	default:
+		// Regular character input - check for runes first
+		if len(msg.Runes) > 0 {
+			// Convert runes to UTF-8 bytes
+			// This handles all printable characters: letters, numbers, symbols, etc.
+			keyBytes = []byte(string(msg.Runes))
+		} else {
+			// Fallback: try string representation for single characters
+			keyStr := msg.String()
+			if keyStr != "" && len(keyStr) == 1 {
+				keyBytes = []byte(keyStr)
+			} else if msg.Type >= tea.KeyCtrlA && msg.Type <= tea.KeyCtrlZ {
+				// Ctrl+letter combinations (Ctrl+A = 1, Ctrl+B = 2, etc.)
+				keyBytes = []byte{byte(msg.Type - tea.KeyCtrlA + 1)}
+			}
+		}
+	}
+
+	// Write to PTY if we have bytes to send
+	if len(keyBytes) > 0 {
+		if err := m.writeToPTY(keyBytes); err != nil {
+			// Error already handled in writeToPTY (closes terminal, sets error)
+			return m, nil
+		}
+	}
+
+	return m, nil
+}
+
+// closeSSHTerminal closes the SSH terminal connection
+func (m *model) closeSSHTerminal() {
+	if m.sshTerminalCmd != nil && m.sshTerminalCmd.Process != nil {
+		m.sshTerminalCmd.Process.Kill()
+	}
+	if m.sshTerminalPTY != nil {
+		m.sshTerminalPTY.Close()
+	}
+	m.sshTerminalActive = false
+	m.sshTerminalEmulator = nil
+	m.sshTerminalParser = nil
+	m.sshTerminalPTY = nil
+	m.sshTerminalCmd = nil
+	if m.sshTerminalRawOutput != nil {
+		m.sshTerminalRawOutput.Reset()
+	}
+	m.sshTerminalHost = ""
+	m.sshTerminalIP = ""
+	m.sshTerminalConfirmExit = false
+	// Clear any pending messages from the channel
+	for {
+		select {
+		case <-m.sshOutputChan:
+		default:
+			return
+		}
+	}
+}
+
+// getANSISequence returns ANSI escape sequence for special keys
+func getANSISequence(key tea.KeyType) []byte {
+	switch key {
+	case tea.KeyUp:
+		return []byte("\x1b[A")
+	case tea.KeyDown:
+		return []byte("\x1b[B")
+	case tea.KeyRight:
+		return []byte("\x1b[C")
+	case tea.KeyLeft:
+		return []byte("\x1b[D")
+	case tea.KeyHome:
+		return []byte("\x1b[H")
+	case tea.KeyEnd:
+		return []byte("\x1b[F")
+	case tea.KeyPgUp:
+		return []byte("\x1b[5~")
+	case tea.KeyPgDown:
+		return []byte("\x1b[6~")
+	case tea.KeyDelete:
+		return []byte("\x1b[3~")
+	default:
+		return nil
+	}
+}
+
+// getFunctionKeySequence returns ANSI escape sequence for function keys (F1-F12)
+func getFunctionKeySequence(key tea.KeyType) []byte {
+	switch key {
+	case tea.KeyF1:
+		return []byte("\x1bOP")
+	case tea.KeyF2:
+		return []byte("\x1bOQ")
+	case tea.KeyF3:
+		return []byte("\x1bOR")
+	case tea.KeyF4:
+		return []byte("\x1bOS")
+	case tea.KeyF5:
+		return []byte("\x1b[15~")
+	case tea.KeyF6:
+		return []byte("\x1b[17~")
+	case tea.KeyF7:
+		return []byte("\x1b[18~")
+	case tea.KeyF8:
+		return []byte("\x1b[19~")
+	case tea.KeyF9:
+		return []byte("\x1b[20~")
+	case tea.KeyF10:
+		return []byte("\x1b[21~")
+	case tea.KeyF11:
+		return []byte("\x1b[23~")
+	case tea.KeyF12:
+		return []byte("\x1b[24~")
+	default:
+		return nil
+	}
 }
 
 func main() {
@@ -4831,36 +5502,15 @@ func main() {
 	oauthClient := oauth2.NewClient(context.Background(), tokenSource)
 	client := godo.NewClient(oauthClient)
 
-	// Main loop: restart TUI after SSH sessions
-	// iTerm optimization: Use standard output and ensure proper terminal detection
-	for {
-		m := initialModel(client)
-		// iTerm-optimized: Ensure proper terminal capabilities
-		// iTerm optimization: Use standard alt screen, bubbletea handles terminal detection
-		p := tea.NewProgram(m, tea.WithAltScreen())
+	// Initialize and run the TUI
+	m := initialModel(client)
+	p := tea.NewProgram(m, tea.WithAltScreen())
 
-		if err := p.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
-			os.Exit(1)
-		}
-
-		// If SSH was requested, execute it now (after program exits)
-		if sshIP != "" {
-			ip := sshIP
-			name := sshName
-			// Clear SSH info before executing (so we can restart TUI after)
-			sshIP = ""
-			sshName = ""
-
-			if err := executeSSH(ip, name); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-				// Continue loop to restart TUI even if SSH fails
-			}
-			// After SSH exits, continue loop to restart TUI
-			continue
-		}
-
-		// If no SSH was requested, exit normally
-		break
+	if err := p.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
+		os.Exit(1)
 	}
+
+	// Application runs entirely within the TUI now
+	// SSH connections are handled within the application
 }

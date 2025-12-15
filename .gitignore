@@ -32,3 +32,4 @@ Thumbs.db
 # Config files with secrets (optional - uncomment if you don't want to track config.yaml)
 # config.yaml
 
+dogoctl
