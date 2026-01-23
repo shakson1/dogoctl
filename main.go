@@ -108,6 +108,9 @@ type model struct {
 	sshTerminalMutex       sync.Mutex               // Mutex for thread-safe terminal output access
 	sshOutputChan          chan tea.Msg             // Channel for SSH output messages
 	sshTerminalConfirmExit bool                     // When true, show exit confirmation dialog
+	// Droplet metrics state
+	dropletMetrics          *DropletMetrics         // Current droplet metrics (CPU, memory, network)
+	loadingMetrics          bool                     // When true, metrics are being loaded
 }
 
 type errMsg error
@@ -130,6 +133,18 @@ type invoicesLoadedMsg []godo.InvoiceListItem
 type billingHistoryLoadedMsg *godo.BillingHistory
 type invoiceDetailsLoadedMsg *godo.Invoice
 type sshTerminalOutputMsg string // New line of output from SSH terminal
+
+// DropletMetrics holds the current usage metrics for a droplet
+type DropletMetrics struct {
+	CPUPercent      float64 // CPU usage percentage
+	MemoryPercent   float64 // Memory usage percentage
+	MemoryUsed      int64   // Memory used in bytes
+	MemoryTotal     int64   // Total memory in bytes
+	NetworkInbound  float64 // Network inbound bandwidth in Mbps
+	NetworkOutbound float64 // Network outbound bandwidth in Mbps
+	LastUpdated     time.Time
+}
+type dropletMetricsLoadedMsg *DropletMetrics
 
 const (
 	viewDroplets         = "droplets"
@@ -365,6 +380,8 @@ func initialModel(client *godo.Client) model {
 		sshTerminalIP:          "",
 		sshOutputChan:          make(chan tea.Msg, 100), // Buffered channel for SSH output
 		sshTerminalConfirmExit: false,                   // No confirmation dialog initially
+		dropletMetrics:          nil,                     // No metrics loaded initially
+		loadingMetrics:          false,                    // Not loading metrics initially
 	}
 }
 
@@ -727,7 +744,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.viewingDetails = true
 							m.selectedDroplet = &m.droplets[i]
 							m.selectedCluster = nil
-							break
+							m.dropletMetrics = nil // Reset metrics
+							m.loadingMetrics = true
+							return m, tea.Batch(
+								loadDropletMetrics(m.client, m.droplets[i].ID),
+								m.spinner.Tick,
+							)
 						}
 					}
 				} else if m.currentView == viewClusters {
@@ -976,6 +998,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.billingDetailsScroll = 0 // Reset scroll position when loading new invoice
 		return m, nil
 
+	case dropletMetricsLoadedMsg:
+		m.dropletMetrics = msg
+		m.loadingMetrics = false
+		return m, nil
+
 	case dropletCreatedMsg:
 		m.creating = false
 		m.successMsg = fmt.Sprintf("✅ Droplet '%s' created successfully! (ID: %d)", msg.Name, msg.ID)
@@ -995,6 +1022,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg
 		m.creating = false
 		m.loading = false
+		m.loadingMetrics = false
 		m.confirmDelete = false
 		// If error occurs during SSH, close terminal
 		if m.sshTerminalActive {
@@ -4144,6 +4172,82 @@ func (m model) renderDropletDetails() string {
 	s.WriteString(detailsBox.Render(detailsContent.String()))
 	s.WriteString("\n\n")
 
+	// Usage Metrics Section
+	metricsLabelStyle := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Width(20)
+	metricsValueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
+	metricsBoxWidth := detailsBoxWidth
+
+	var metricsContent strings.Builder
+	metricsContent.WriteString(metricsLabelStyle.Render("📊 Usage Metrics:") + "\n")
+
+	if m.loadingMetrics {
+		metricsContent.WriteString("  " + metricsValueStyle.Render("Loading metrics...") + "\n")
+	} else if m.dropletMetrics != nil {
+		// CPU Usage - format nicely
+		// Note: 0% = idle/free, 100% = fully utilized/busy
+		var cpuValue string
+		if m.dropletMetrics.CPUPercent < 0.1 {
+			cpuValue = "< 0.1%"
+		} else if m.dropletMetrics.CPUPercent >= 100 {
+			cpuValue = "100.0%"
+		} else {
+			cpuValue = fmt.Sprintf("%.1f%%", m.dropletMetrics.CPUPercent)
+		}
+		metricsContent.WriteString(fmt.Sprintf("  %s %s\n",
+			metricsLabelStyle.Render("⚡ CPU Usage:"),
+			metricsValueStyle.Render(cpuValue)))
+
+		// Memory Usage
+		if m.dropletMetrics.MemoryTotal > 0 {
+			memUsedGB := float64(m.dropletMetrics.MemoryUsed) / (1024 * 1024 * 1024)
+			memTotalGB := float64(m.dropletMetrics.MemoryTotal) / (1024 * 1024 * 1024)
+			memValue := fmt.Sprintf("%.1f%% (%.2f GB / %.2f GB)",
+				m.dropletMetrics.MemoryPercent, memUsedGB, memTotalGB)
+			metricsContent.WriteString(fmt.Sprintf("  %s %s\n",
+				metricsLabelStyle.Render("💾 Memory:"),
+				metricsValueStyle.Render(memValue)))
+		} else {
+			metricsContent.WriteString(fmt.Sprintf("  %s %s\n",
+				metricsLabelStyle.Render("💾 Memory:"),
+				metricsValueStyle.Render("N/A")))
+		}
+
+		// Network Usage
+		netValue := fmt.Sprintf("↓ %.2f Mbps  ↑ %.2f Mbps",
+			m.dropletMetrics.NetworkInbound,
+			m.dropletMetrics.NetworkOutbound)
+		metricsContent.WriteString(fmt.Sprintf("  %s %s\n",
+			metricsLabelStyle.Render("🌐 Network:"),
+			metricsValueStyle.Render(netValue)))
+
+		// Last updated time
+		if !m.dropletMetrics.LastUpdated.IsZero() {
+			timeAgo := time.Since(m.dropletMetrics.LastUpdated)
+			timeStr := ""
+			if timeAgo < time.Minute {
+				timeStr = "just now"
+			} else if timeAgo < time.Hour {
+				timeStr = fmt.Sprintf("%.0f min ago", timeAgo.Minutes())
+			} else {
+				timeStr = fmt.Sprintf("%.1f hours ago", timeAgo.Hours())
+			}
+			metricsContent.WriteString(fmt.Sprintf("  %s %s\n",
+				metricsLabelStyle.Render("🕐 Updated:"),
+				metricsValueStyle.Render(timeStr)))
+		}
+	} else {
+		metricsContent.WriteString("  " + metricsValueStyle.Render("Metrics not available") + "\n")
+	}
+
+	metricsBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Padding(1, 2).
+		Width(metricsBoxWidth)
+
+	s.WriteString(metricsBox.Render(metricsContent.String()))
+	s.WriteString("\n\n")
+
 	// Show SSH option if droplet is active and has IP addresses (publicIP and privateIP already declared above)
 	helpText := helpStyle.Render("[esc/enter] Back  [q] Quit")
 	if d.Status == "active" && (publicIP != "" || privateIP != "") {
@@ -4970,6 +5074,211 @@ func loadInvoiceDetails(client *godo.Client, invoiceUUID string) tea.Cmd {
 			return errMsg(err)
 		}
 		return invoiceDetailsLoadedMsg(invoice)
+	}
+}
+
+// normalizeCPUValue converts various CPU metric formats to a 0-100% percentage
+func normalizeCPUValue(rawValue float64) float64 {
+	// If value is between 0 and 1, it's a fraction - convert to percentage
+	if rawValue >= 0 && rawValue <= 1 {
+		return rawValue * 100
+	}
+	
+	// If value is between 1 and 100, assume it's already a percentage
+	if rawValue > 1 && rawValue <= 100 {
+		return rawValue
+	}
+	
+	// If value is > 100, it's likely in a different unit
+	// Try to normalize by dividing by appropriate powers of 10
+	if rawValue > 100 {
+		// For very large values, divide by 1000000 (common for micro-percentages)
+		if rawValue > 1000000 {
+			normalized := rawValue / 1000000
+			if normalized <= 100 {
+				return normalized
+			}
+		}
+		// For moderately large values, divide by 10000
+		if rawValue > 10000 {
+			normalized := rawValue / 10000
+			if normalized <= 100 {
+				return normalized
+			}
+		}
+		// For values between 100-10000, divide by 100
+		normalized := rawValue / 100
+		if normalized <= 100 {
+			return normalized
+		}
+		// If still too large, cap at 100
+		return 100
+	}
+	
+	// Negative values are invalid, return 0
+	if rawValue < 0 {
+		return 0
+	}
+	
+	return rawValue
+}
+
+func loadDropletMetrics(client *godo.Client, dropletID int) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		now := time.Now()
+		start := now.Add(-1 * time.Hour) // Get metrics for the last hour
+		end := now
+
+		hostID := fmt.Sprintf("%d", dropletID)
+		metrics := &DropletMetrics{
+			LastUpdated: now,
+		}
+
+		// Get CPU metrics - need to calculate percentage from time series
+		// Use a shorter time window (last 5 minutes) for more accurate current CPU usage
+		cpuStart := now.Add(-5 * time.Minute)
+		cpuReq := &godo.DropletMetricsRequest{
+			HostID: hostID,
+			Start:  cpuStart,
+			End:    end,
+		}
+		cpuResp, _, err := client.Monitoring.GetDropletCPU(ctx, cpuReq)
+		if err == nil && cpuResp != nil && len(cpuResp.Data.Result) > 0 {
+			// CPU metrics are cumulative CPU time values
+			// Calculate CPU usage percentage from the rate of change
+			if len(cpuResp.Data.Result[0].Values) >= 2 {
+				// Get last two values to calculate rate
+				lastIdx := len(cpuResp.Data.Result[0].Values) - 1
+				lastValue := cpuResp.Data.Result[0].Values[lastIdx]
+				prevValue := cpuResp.Data.Result[0].Values[lastIdx-1]
+				
+				cpuDelta := float64(lastValue.Value) - float64(prevValue.Value)
+				timeDeltaSeconds := float64(lastValue.Timestamp - prevValue.Timestamp)
+				
+				// Calculate CPU usage percentage
+				// CPU values are typically in jiffies (usually 100 jiffies = 1 second)
+				// CPU usage = (CPU time used / Total time) * 100
+				// If CPU delta is in jiffies and time is in seconds:
+				// - Convert time to jiffies (assuming 100 Hz = 100 jiffies/sec)
+				// - CPU usage = (cpuDelta / (timeDeltaSeconds * 100)) * 100
+				// - Simplified: cpuDelta / timeDeltaSeconds
+				
+				if timeDeltaSeconds > 0 {
+					// Calculate CPU usage from the rate of change
+					// The CPU metric might be in different units, so we need to normalize
+					cpuDeltaAbs := cpuDelta
+					if cpuDeltaAbs < 0 {
+						cpuDeltaAbs = -cpuDeltaAbs
+					}
+					
+					// Try different interpretations:
+					// 1. Direct rate: cpuDelta / timeDeltaSeconds
+					// 2. If CPU time is in jiffies (100 jiffies/sec): (cpuDelta / (timeDeltaSeconds * 100)) * 100
+					// 3. If value is very large, it might need scaling
+					
+					cpuUsage := cpuDelta / timeDeltaSeconds
+					
+					// If the result is unreasonably large, try scaling
+					if cpuUsage > 1000 {
+						// Value might be in micro-units or need different scaling
+						cpuUsage = cpuUsage / 1000000
+					} else if cpuUsage > 100 {
+						// Try dividing by 100
+						cpuUsage = cpuUsage / 100
+					}
+					
+					// If still > 100, it might represent idle time - invert it
+					if cpuUsage > 100 {
+						// Try inverting: if it's idle percentage, usage = 100 - idle
+						// But first normalize to 0-100 range
+						if cpuUsage > 1000000 {
+							cpuUsage = cpuUsage / 1000000
+						}
+						if cpuUsage > 100 {
+							// Might be idle time, try inverting
+							cpuUsage = 100 - (cpuUsage / 100)
+							if cpuUsage < 0 {
+								cpuUsage = 0
+							}
+						}
+					}
+					
+					// Cap at 0-100%
+					if cpuUsage > 100 {
+						cpuUsage = 100
+					}
+					if cpuUsage < 0 {
+						cpuUsage = 0
+					}
+					metrics.CPUPercent = cpuUsage
+				}
+			} else if len(cpuResp.Data.Result[0].Values) == 1 {
+				// Only one data point - can't calculate rate
+				// Try to normalize the single value as fallback
+				lastValue := cpuResp.Data.Result[0].Values[0]
+				cpuRaw := float64(lastValue.Value)
+				metrics.CPUPercent = normalizeCPUValue(cpuRaw)
+			}
+		}
+
+		// Get memory metrics
+		memTotalReq := &godo.DropletMetricsRequest{
+			HostID: hostID,
+			Start:  start,
+			End:    end,
+		}
+		memTotalResp, _, err := client.Monitoring.GetDropletTotalMemory(ctx, memTotalReq)
+		memFreeResp, _, err2 := client.Monitoring.GetDropletFreeMemory(ctx, memTotalReq)
+		if err == nil && err2 == nil && memTotalResp != nil && memFreeResp != nil {
+			var totalMem, freeMem float64
+			if len(memTotalResp.Data.Result) > 0 && len(memTotalResp.Data.Result[0].Values) > 0 {
+				lastValue := memTotalResp.Data.Result[0].Values[len(memTotalResp.Data.Result[0].Values)-1]
+				totalMem = float64(lastValue.Value)
+				metrics.MemoryTotal = int64(totalMem)
+			}
+			if len(memFreeResp.Data.Result) > 0 && len(memFreeResp.Data.Result[0].Values) > 0 {
+				lastValue := memFreeResp.Data.Result[0].Values[len(memFreeResp.Data.Result[0].Values)-1]
+				freeMem = float64(lastValue.Value)
+			}
+			if totalMem > 0 {
+				usedMem := totalMem - freeMem
+				metrics.MemoryUsed = int64(usedMem)
+				metrics.MemoryPercent = (usedMem / totalMem) * 100
+			}
+		}
+
+		// Get network metrics (public interface, both directions)
+		networkReq := &godo.DropletBandwidthMetricsRequest{
+			DropletMetricsRequest: godo.DropletMetricsRequest{
+				HostID: hostID,
+				Start:  start,
+				End:    end,
+			},
+			Interface: "public",
+		}
+
+		// Get inbound bandwidth
+		networkReq.Direction = "inbound"
+		netInResp, _, err := client.Monitoring.GetDropletBandwidth(ctx, networkReq)
+		if err == nil && netInResp != nil && len(netInResp.Data.Result) > 0 {
+			if len(netInResp.Data.Result[0].Values) > 0 {
+				lastValue := netInResp.Data.Result[0].Values[len(netInResp.Data.Result[0].Values)-1]
+				metrics.NetworkInbound = float64(lastValue.Value) / 1000000.0 // Convert bytes to Mbps
+			}
+		}
+
+		// Get outbound bandwidth
+		networkReq.Direction = "outbound"
+		netOutResp, _, err := client.Monitoring.GetDropletBandwidth(ctx, networkReq)
+		if err == nil && netOutResp != nil && len(netOutResp.Data.Result) > 0 {
+			if len(netOutResp.Data.Result[0].Values) > 0 {
+				lastValue := netOutResp.Data.Result[0].Values[len(netOutResp.Data.Result[0].Values)-1]
+				metrics.NetworkOutbound = float64(lastValue.Value) / 1000000.0 // Convert bytes to Mbps
+			}
+		}
+
+		return dropletMetricsLoadedMsg(metrics)
 	}
 }
 
